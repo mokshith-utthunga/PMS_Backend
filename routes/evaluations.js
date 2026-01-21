@@ -886,4 +886,350 @@ router.get('/rating-rejections', authMiddleware, async (req, res) => {
   }
 });
 
+// ========== YEAR-END EVALUATION ==========
+
+// GET /api/evaluations/year-end-evaluation
+// Get year-end evaluation for an employee
+router.get('/year-end-evaluation', authMiddleware, async (req, res) => {
+  try {
+    const { employee_id, cycle_id } = req.query;
+    
+    if (!employee_id || !cycle_id) {
+      return res.status(400).json({ error: 'employee_id and cycle_id are required' });
+    }
+
+    // Get manager_evaluations record which contains quarterly ratings and year-end data
+    const result = await query(
+      `SELECT 
+        me.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.date_of_joining,
+        e.department,
+        m.full_name as evaluator_name,
+        m.emp_code as evaluator_code
+       FROM manager_evaluations me
+       INNER JOIN employees e ON e.id = me.employee_id
+       LEFT JOIN employees m ON m.id = me.evaluator_id
+       WHERE me.employee_id = $1 AND me.cycle_id = $2`,
+      [employee_id, cycle_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ data: null });
+    }
+
+    // Get count of completed quarters
+    const row = result.rows[0];
+    const completedQuarters = [row.q1_rating, row.q2_rating, row.q3_rating, row.q4_rating]
+      .filter(r => r !== null).length;
+
+    res.json({ 
+      data: { 
+        ...row, 
+        completed_quarters: completedQuarters 
+      } 
+    });
+  } catch (error) {
+    console.error('Get year-end evaluation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/year-end-evaluation
+// Submit/update year-end evaluation (manager submits)
+router.post('/year-end-evaluation', authMiddleware, async (req, res) => {
+  try {
+    const { 
+      employee_id, 
+      cycle_id, 
+      evaluator_id, 
+      overall_rating, 
+      overall_comments, 
+      potential_rating,
+      status 
+    } = req.body;
+    
+    if (!employee_id || !cycle_id || !evaluator_id) {
+      return res.status(400).json({ error: 'employee_id, cycle_id, and evaluator_id are required' });
+    }
+
+    // Check if overall_comments is provided (required for submission)
+    if (status === 'submitted' && (!overall_comments || !overall_comments.trim())) {
+      return res.status(400).json({ error: 'Overall feedback is required for submission' });
+    }
+
+    // Check if overall_rating is provided (required for submission)
+    if (status === 'submitted' && !overall_rating) {
+      return res.status(400).json({ error: 'Overall rating is required for submission' });
+    }
+
+    // Check if manager_evaluation exists
+    const existingResult = await query(
+      `SELECT * FROM manager_evaluations WHERE employee_id = $1 AND cycle_id = $2`,
+      [employee_id, cycle_id]
+    );
+
+    let result;
+    const finalStatus = status || 'pending';
+    const submittedAt = status === 'submitted' ? new Date() : null;
+    
+    if (existingResult.rows.length > 0) {
+      // Update existing - set submitted_at if submitting
+      result = await query(
+        `UPDATE manager_evaluations SET
+          evaluator_id = $1,
+          overall_rating = $2,
+          overall_comments = $3,
+          potential_rating = $4,
+          status = $5,
+          submitted_at = CASE WHEN $6 = 'submitted' THEN NOW() ELSE submitted_at END,
+          updated_at = NOW()
+         WHERE employee_id = $7 AND cycle_id = $8
+         RETURNING *`,
+        [
+          evaluator_id,
+          overall_rating,
+          overall_comments,
+          potential_rating,
+          finalStatus,
+          finalStatus,  // Pass status twice for the CASE WHEN
+          employee_id,
+          cycle_id
+        ]
+      );
+    } else {
+      // Create new
+      result = await query(
+        `INSERT INTO manager_evaluations (
+          id, employee_id, cycle_id, evaluator_id, overall_rating, 
+          overall_comments, potential_rating,
+          status, submitted_at, created_at, updated_at
+        )
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+        RETURNING *`,
+        [
+          employee_id,
+          cycle_id,
+          evaluator_id,
+          overall_rating,
+          overall_comments,
+          potential_rating,
+          finalStatus,
+          submittedAt
+        ]
+      );
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Year-end evaluation upsert error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/evaluations/hr-pending-year-end-reviews
+// Get year-end reviews pending HR approval
+router.get('/hr-pending-year-end-reviews', authMiddleware, async (req, res) => {
+  try {
+    const { cycle_id } = req.query;
+    
+    let sql = `
+      SELECT 
+        me.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.date_of_joining,
+        e.department,
+        m.full_name as manager_name,
+        m.emp_code as manager_code,
+        pc.name as cycle_name
+      FROM manager_evaluations me
+      INNER JOIN employees e ON e.id = me.employee_id
+      INNER JOIN employees m ON m.id = me.evaluator_id
+      INNER JOIN performance_cycles pc ON pc.id = me.cycle_id
+      WHERE me.status = 'submitted' 
+        AND me.released_at IS NULL
+    `;
+    const params = [];
+    let idx = 1;
+
+    if (cycle_id) {
+      sql += ` AND me.cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+
+    sql += ' ORDER BY me.submitted_at DESC';
+    
+    const result = await query(sql, params);
+    
+    // Add completed quarters count to each result
+    const data = result.rows.map(row => ({
+      ...row,
+      completed_quarters: [row.q1_rating, row.q2_rating, row.q3_rating, row.q4_rating]
+        .filter(r => r !== null).length
+    }));
+
+    res.json({ data });
+  } catch (error) {
+    console.error('Get HR pending year-end reviews error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/hr-approve-year-end-review', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id } = req.body;
+
+    if (!manager_evaluation_id) {
+      return res.status(400).json({ error: 'manager_evaluation_id is required' });
+    }
+
+    // Update manager_evaluations with HR approval and release
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET released_at = NOW(),
+           status = 'released',
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted' AND released_at IS NULL
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Year-end review not found or already approved' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('HR approve year-end review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/hr-reject-year-end-review
+// HR rejects a year-end review (sends back to manager)
+router.post('/hr-reject-year-end-review', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id, rejection_reason } = req.body;
+
+    if (!manager_evaluation_id || !rejection_reason) {
+      return res.status(400).json({ error: 'manager_evaluation_id and rejection_reason are required' });
+    }
+
+    // Update status back to in_progress for manager to revise
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET status = 'in_progress',
+           released_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted'
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Year-end review not found or already processed' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('HR reject year-end review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/employee-accept-year-end-rating
+// Employee accepts their year-end rating
+router.post('/employee-accept-year-end-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id } = req.body;
+    const userId = req.user?.userId;
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_evaluation_id) {
+      return res.status(400).json({ error: 'manager_evaluation_id is required' });
+    }
+
+    // Mark acknowledged_at in manager_evaluations
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET acknowledged_at = NOW(),
+           status = 'completed',
+           updated_at = NOW()
+       WHERE id = $1 AND released_at IS NOT NULL
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Year-end evaluation not found or not yet released by HR' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Employee accept year-end rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/employee-reject-year-end-rating
+// Employee rejects their year-end rating
+router.post('/employee-reject-year-end-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id, rejection_reason, cycle_id } = req.body;
+    const userId = req.user?.userId;
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_evaluation_id || !rejection_reason || !cycle_id) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    // Get employee_id from user
+    const empResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Create rating rejection for year-end (quarter = null)
+    const rejectionResult = await query(
+      `INSERT INTO rating_rejections 
+       (id, employee_id, cycle_id, quarter, manager_review_id, rejection_reason, status, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'pending', NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter) WHERE quarter IS NULL DO UPDATE SET
+         rejection_reason = EXCLUDED.rejection_reason,
+         status = 'pending',
+         updated_at = NOW()
+       RETURNING *`,
+      [employeeId, cycle_id, manager_evaluation_id, rejection_reason]
+    );
+
+    // Update acknowledgment_comments in manager_evaluations with rejection reason
+    await query(
+      `UPDATE manager_evaluations 
+       SET acknowledgment_comments = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [rejection_reason, manager_evaluation_id]
+    );
+
+    res.json({ data: rejectionResult.rows[0] });
+  } catch (error) {
+    console.error('Employee reject year-end rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 export default router;
