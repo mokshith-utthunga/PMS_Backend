@@ -7,7 +7,7 @@ const router = express.Router();
 // GET /api/goals - Get goals with filters
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, status, type } = req.query;
+    const { employee_id, cycle_id, status, type, quarter, kra_id } = req.query;
     
     let sql = 'SELECT * FROM goals WHERE 1=1';
     const params = [];
@@ -28,6 +28,19 @@ router.get('/', authMiddleware, async (req, res) => {
     if (type) {
       sql += ` AND type = $${idx++}`;
       params.push(type);
+    }
+    if (kra_id) {
+      sql += ` AND kra_id = $${idx++}`;
+      params.push(kra_id);
+    }
+    // Only filter by quarter when a valid quarter number (1-4) is provided
+    // quarter=null or quarter=undefined means "no quarter filter" (backward compatible)
+    if (quarter !== undefined && quarter !== 'null' && quarter !== null && quarter !== '') {
+      const quarterNum = parseInt(quarter);
+      if (quarterNum >= 1 && quarterNum <= 4) {
+        sql += ` AND quarter = $${idx++}`;
+        params.push(quarterNum);
+      }
     }
 
     sql += ' ORDER BY created_at DESC';
@@ -125,11 +138,11 @@ router.get('/:id', authMiddleware, async (req, res) => {
 // POST /api/goals
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, kra_id, goal_type, title, description, weight, target_value, metric_type, due_date, status } = req.body;
+    const { employee_id, cycle_id, kra_id, goal_type, title, description, weight, target_value, metric_type, due_date, status, quarter } = req.body;
     
     const result = await query(
-      `INSERT INTO goals (id, employee_id, cycle_id, kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+      `INSERT INTO goals (id, employee_id, cycle_id, kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, quarter, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
        RETURNING *`,
       [
         employee_id ?? null,
@@ -142,7 +155,8 @@ router.post('/', authMiddleware, async (req, res) => {
         target_value ?? null,
         weight ?? null,
         due_date ?? null,
-        status || 'draft'
+        status || 'draft',
+        quarter || null
       ]
     );
     res.status(201).json({ data: result.rows[0] });
@@ -154,7 +168,7 @@ router.post('/', authMiddleware, async (req, res) => {
 // PUT /api/goals/:id
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, manager_comments } = req.body;
+    const { kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, manager_comments, quarter } = req.body;
     
     const result = await query(
       `UPDATE goals SET
@@ -168,8 +182,9 @@ router.put('/:id', authMiddleware, async (req, res) => {
         due_date = COALESCE($8, due_date),
         status = COALESCE($9, status),
         manager_comments = COALESCE($10, manager_comments),
+        quarter = COALESCE($11, quarter),
         updated_at = NOW()
-       WHERE id = $11 RETURNING *`,
+       WHERE id = $12 RETURNING *`,
       [
         kra_id ?? null,
         title ?? null,
@@ -181,6 +196,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
         due_date ?? null,
         status ?? null,
         manager_comments ?? null,
+        quarter !== undefined ? (quarter || null) : undefined,
         req.params.id
       ]
     );
@@ -254,6 +270,94 @@ router.delete('/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Goal not found' });
     }
     res.json({ message: 'Goal deleted' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/goals/clone - Clone goals from one quarter to another
+router.post('/clone', authMiddleware, async (req, res) => {
+  try {
+    const { employee_id, cycle_id, source_quarter, target_quarter } = req.body;
+    
+    if (!employee_id || !cycle_id || !source_quarter || !target_quarter) {
+      return res.status(400).json({ error: 'employee_id, cycle_id, source_quarter, and target_quarter are required' });
+    }
+    
+    if (source_quarter === target_quarter) {
+      return res.status(400).json({ error: 'Source and target quarters must be different' });
+    }
+    
+    // Get source KRAs and KPIs
+    const sourceKrasResult = await query(
+      'SELECT * FROM kras WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3',
+      [employee_id, cycle_id, source_quarter]
+    );
+    
+    const sourceKpisResult = await query(
+      'SELECT * FROM goals WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 AND kra_id IS NOT NULL',
+      [employee_id, cycle_id, source_quarter]
+    );
+    
+    const sourceKras = sourceKrasResult.rows;
+    const sourceKpis = sourceKpisResult.rows;
+    
+    if (sourceKras.length === 0) {
+      return res.status(404).json({ error: 'No KRAs found for source quarter' });
+    }
+    
+    // Create a map of old KRA IDs to new KRA IDs
+    const kraIdMap = new Map();
+    const clonedKras = [];
+    
+    // Clone KRAs
+    for (const kra of sourceKras) {
+      const newKraResult = await query(
+        `INSERT INTO kras (id, employee_id, cycle_id, title, description, weight, status, quarter, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         RETURNING *`,
+        [employee_id, cycle_id, kra.title, kra.description, kra.weight, 'draft', target_quarter]
+      );
+      const newKra = newKraResult.rows[0];
+      kraIdMap.set(kra.id, newKra.id);
+      clonedKras.push(newKra);
+    }
+    
+    // Clone KPIs
+    const clonedKpis = [];
+    for (const kpi of sourceKpis) {
+      const newKraId = kraIdMap.get(kpi.kra_id);
+      if (newKraId) {
+        const newKpiResult = await query(
+          `INSERT INTO goals (id, employee_id, cycle_id, kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, quarter, created_at, updated_at)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+           RETURNING *`,
+          [
+            employee_id,
+            cycle_id,
+            newKraId,
+            kpi.title,
+            kpi.description,
+            kpi.goal_type,
+            kpi.metric_type,
+            kpi.target_value,
+            kpi.weight,
+            kpi.due_date,
+            'draft',
+            target_quarter
+          ]
+        );
+        clonedKpis.push(newKpiResult.rows[0]);
+      }
+    }
+    
+    res.status(201).json({
+      data: {
+        kras: clonedKras,
+        kpis: clonedKpis
+      },
+      message: `Cloned ${clonedKras.length} KRAs and ${clonedKpis.length} KPIs from Q${source_quarter} to Q${target_quarter}`
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

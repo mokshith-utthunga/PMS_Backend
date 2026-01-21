@@ -7,7 +7,7 @@ const router = express.Router();
 // GET /api/kras - Get KRAs with filters
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, status } = req.query;
+    const { employee_id, cycle_id, status, quarter } = req.query;
     
     let sql = 'SELECT * FROM kras WHERE 1=1';
     const params = [];
@@ -24,6 +24,15 @@ router.get('/', authMiddleware, async (req, res) => {
     if (status) {
       sql += ` AND status = $${idx++}`;
       params.push(status);
+    }
+    // Only filter by quarter when a valid quarter number (1-4) is provided
+    // quarter=null or quarter=undefined means "no quarter filter" (backward compatible)
+    if (quarter !== undefined && quarter !== 'null' && quarter !== null && quarter !== '') {
+      const quarterNum = parseInt(quarter);
+      if (quarterNum >= 1 && quarterNum <= 4) {
+        sql += ` AND quarter = $${idx++}`;
+        params.push(quarterNum);
+      }
     }
 
     sql += ' ORDER BY created_at ASC';
@@ -67,13 +76,13 @@ router.get('/my', authMiddleware, async (req, res) => {
 // POST /api/kras
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, title, description, weight, status } = req.body;
+    const { employee_id, cycle_id, title, description, weight, status, quarter } = req.body;
     
     const result = await query(
-      `INSERT INTO kras (id, employee_id, cycle_id, title, description, weight, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), NOW())
+      `INSERT INTO kras (id, employee_id, cycle_id, title, description, weight, status, quarter, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
        RETURNING *`,
-      [employee_id, cycle_id, title, description, weight, status || 'draft']
+      [employee_id, cycle_id, title, description, weight, status || 'draft', quarter || null]
     );
     res.status(201).json({ data: result.rows[0] });
   } catch (error) {
@@ -84,7 +93,7 @@ router.post('/', authMiddleware, async (req, res) => {
 // PUT /api/kras/:id
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { title, description, weight, status } = req.body;
+    const { title, description, weight, status, quarter } = req.body;
     
     const result = await query(
       `UPDATE kras SET
@@ -92,13 +101,15 @@ router.put('/:id', authMiddleware, async (req, res) => {
         description = $2,
         weight = COALESCE($3, weight),
         status = COALESCE($4, status),
+        quarter = COALESCE($5, quarter),
         updated_at = NOW()
-       WHERE id = $5 RETURNING *`,
+       WHERE id = $6 RETURNING *`,
       [
         title ?? null,
         description ?? null,
         weight ?? null,
         status ?? null,
+        quarter !== undefined ? (quarter || null) : undefined,
         req.params.id
       ]
     );

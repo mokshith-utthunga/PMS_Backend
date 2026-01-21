@@ -10,6 +10,7 @@
     "migrate": "node scripts/run-all-migrations.js",
     "migrate:001": "node scripts/run-migration.js 001_schema_refactor.sql",
     "migrate:002": "node scripts/run-migration.js 002_fix_manager_code_fkey.sql",
+    "migrate:003": "node scripts/run-migration.js 003_add_quarter_to_goals.sql",
     "migrate:hr-review": "node scripts/run-migration.js 002_hr_review_workflow.sql"
   },
   "dependencies": {
