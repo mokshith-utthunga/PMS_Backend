@@ -7,7 +7,7 @@ const router = express.Router();
 // GET /api/kras - Get KRAs with filters
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, status } = req.query;
+    const { employee_id, cycle_id, status, quarter } = req.query;
     
     let sql = 'SELECT * FROM kras WHERE 1=1';
     const params = [];
@@ -25,6 +25,10 @@ router.get('/', authMiddleware, async (req, res) => {
       sql += ` AND status = $${idx++}`;
       params.push(status);
     }
+    if (quarter) {
+      sql += ` AND quarter = $${idx++}`;
+      params.push(parseInt(quarter));
+    }
 
     sql += ' ORDER BY created_at ASC';
     const result = await query(sql, params);
@@ -37,7 +41,7 @@ router.get('/', authMiddleware, async (req, res) => {
 // GET /api/kras/my - Get current user's KRAs
 router.get('/my', authMiddleware, async (req, res) => {
   try {
-    const { cycle_id } = req.query;
+    const { cycle_id, quarter } = req.query;
     
     const empResult = await query(
       'SELECT id FROM employees WHERE profile_id = $1',
@@ -50,10 +54,15 @@ router.get('/my', authMiddleware, async (req, res) => {
     
     let sql = 'SELECT * FROM kras WHERE employee_id = $1';
     const params = [empResult.rows[0].id];
+    let idx = 2;
     
     if (cycle_id) {
-      sql += ' AND cycle_id = $2';
+      sql += ` AND cycle_id = $${idx++}`;
       params.push(cycle_id);
+    }
+    if (quarter) {
+      sql += ` AND quarter = $${idx++}`;
+      params.push(parseInt(quarter));
     }
     sql += ' ORDER BY created_at ASC';
     
@@ -67,13 +76,13 @@ router.get('/my', authMiddleware, async (req, res) => {
 // POST /api/kras
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, title, description, weight, status } = req.body;
+    const { employee_id, cycle_id, title, description, weight, status, quarter, kra_template_id } = req.body;
     
     const result = await query(
-      `INSERT INTO kras (id, employee_id, cycle_id, title, description, weight, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), NOW())
+      `INSERT INTO kras (id, employee_id, cycle_id, kra_template_id, title, description, weight, status, quarter, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
        RETURNING *`,
-      [employee_id, cycle_id, title, description, weight, status || 'draft']
+      [employee_id, cycle_id, kra_template_id || null, title, description, weight, status || 'draft', quarter || null]
     );
     res.status(201).json({ data: result.rows[0] });
   } catch (error) {
@@ -84,7 +93,7 @@ router.post('/', authMiddleware, async (req, res) => {
 // PUT /api/kras/:id
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { title, description, weight, status } = req.body;
+    const { title, description, weight, status, quarter } = req.body;
     
     const result = await query(
       `UPDATE kras SET
@@ -92,13 +101,15 @@ router.put('/:id', authMiddleware, async (req, res) => {
         description = $2,
         weight = COALESCE($3, weight),
         status = COALESCE($4, status),
+        quarter = COALESCE($5, quarter),
         updated_at = NOW()
-       WHERE id = $5 RETURNING *`,
+       WHERE id = $6 RETURNING *`,
       [
         title ?? null,
         description ?? null,
         weight ?? null,
         status ?? null,
+        quarter ?? null,
         req.params.id
       ]
     );
@@ -426,7 +437,7 @@ router.get('/kpi-templates', authMiddleware, async (req, res) => {
 // POST /api/kras/kpi-templates - Create a new KPI template
 router.post('/kpi-templates', authMiddleware, async (req, res) => {
   try {
-    const { kra_template_id, title, description, metric_type, suggested_target, suggested_weight, target_value, weight } = req.body;
+    const { kra_template_id, title, description, metric_type, suggested_target, suggested_weight, target_value, weight, calibration } = req.body;
     
     if (!kra_template_id || !title) {
       return res.status(400).json({ error: 'kra_template_id and title are required' });
@@ -436,11 +447,23 @@ router.post('/kpi-templates', authMiddleware, async (req, res) => {
     const target = suggested_target || target_value || null;
     const kpiWeight = suggested_weight || weight || 50;
     
+    // Validate and format calibration if provided
+    let calibrationJson = null;
+    if (calibration) {
+      if (Array.isArray(calibration)) {
+        calibrationJson = JSON.stringify(calibration);
+      } else if (typeof calibration === 'string') {
+        // Already JSON string, validate it
+        JSON.parse(calibration);
+        calibrationJson = calibration;
+      }
+    }
+    
     const result = await query(
-      `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight, calibration)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [kra_template_id, title, description || null, metric_type || 'number', target, kpiWeight]
+      [kra_template_id, title, description || null, metric_type || 'number', target, kpiWeight, calibrationJson]
     );
     
     res.status(201).json({ data: result.rows[0] });
@@ -454,11 +477,25 @@ router.post('/kpi-templates', authMiddleware, async (req, res) => {
 router.put('/kpi-templates/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, description, metric_type, suggested_target, suggested_weight, target_value, weight } = req.body;
+    const { title, description, metric_type, suggested_target, suggested_weight, target_value, weight, calibration } = req.body;
     
     // Support both new field names (suggested_target, suggested_weight) and legacy (target_value, weight)
     const target = suggested_target !== undefined ? suggested_target : (target_value !== undefined ? target_value : null);
     const kpiWeight = suggested_weight !== undefined ? suggested_weight : (weight !== undefined ? weight : undefined);
+    
+    // Validate and format calibration if provided
+    let calibrationJson = undefined;
+    if (calibration !== undefined) {
+      if (calibration === null) {
+        calibrationJson = null;
+      } else if (Array.isArray(calibration)) {
+        calibrationJson = JSON.stringify(calibration);
+      } else if (typeof calibration === 'string') {
+        // Already JSON string, validate it
+        JSON.parse(calibration);
+        calibrationJson = calibration;
+      }
+    }
     
     // Build update query dynamically
     const updates = [];
@@ -484,6 +521,10 @@ router.put('/kpi-templates/:id', authMiddleware, async (req, res) => {
     if (kpiWeight !== undefined) {
       updates.push(`suggested_weight = $${paramIndex++}`);
       values.push(kpiWeight);
+    }
+    if (calibrationJson !== undefined) {
+      updates.push(`calibration = $${paramIndex++}`);
+      values.push(calibrationJson);
     }
     
     if (updates.length === 0) {

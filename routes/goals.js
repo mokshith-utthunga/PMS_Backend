@@ -7,7 +7,7 @@ const router = express.Router();
 // GET /api/goals - Get goals with filters
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, status, type } = req.query;
+    const { employee_id, cycle_id, status, type, quarter } = req.query;
     
     let sql = 'SELECT * FROM goals WHERE 1=1';
     const params = [];
@@ -29,6 +29,10 @@ router.get('/', authMiddleware, async (req, res) => {
       sql += ` AND type = $${idx++}`;
       params.push(type);
     }
+    if (quarter) {
+      sql += ` AND quarter = $${idx++}`;
+      params.push(parseInt(quarter));
+    }
 
     sql += ' ORDER BY created_at DESC';
     const result = await query(sql, params);
@@ -41,7 +45,7 @@ router.get('/', authMiddleware, async (req, res) => {
 // GET /api/goals/my - Get current user's goals
 router.get('/my', authMiddleware, async (req, res) => {
   try {
-    const { cycle_id } = req.query;
+    const { cycle_id, quarter } = req.query;
     
     // First get employee ID for current user
     const empResult = await query(
@@ -55,10 +59,15 @@ router.get('/my', authMiddleware, async (req, res) => {
     
     let sql = 'SELECT * FROM goals WHERE employee_id = $1';
     const params = [empResult.rows[0].id];
+    let idx = 2;
     
     if (cycle_id) {
-      sql += ' AND cycle_id = $2';
+      sql += ` AND cycle_id = $${idx++}`;
       params.push(cycle_id);
+    }
+    if (quarter) {
+      sql += ` AND quarter = $${idx++}`;
+      params.push(parseInt(quarter));
     }
     sql += ' ORDER BY created_at DESC';
     
@@ -72,7 +81,7 @@ router.get('/my', authMiddleware, async (req, res) => {
 // GET /api/goals/pending-approvals - For managers
 router.get('/pending-approvals', authMiddleware, async (req, res) => {
   try {
-    const { cycle_id } = req.query;
+    const { cycle_id, quarter } = req.query;
     
     // Get manager's employee record (need emp_code for manager_code query)
     const empResult = await query(
@@ -93,10 +102,15 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
       WHERE e.manager_code = $1 AND g.status = 'submitted'
     `;
     const params = [managerCode];
+    let idx = 2;
     
     if (cycle_id) {
-      sql += ' AND g.cycle_id = $2';
+      sql += ` AND g.cycle_id = $${idx++}`;
       params.push(cycle_id);
+    }
+    if (quarter) {
+      sql += ` AND g.quarter = $${idx++}`;
+      params.push(parseInt(quarter));
     }
     
     const result = await query(sql, params);
@@ -125,24 +139,39 @@ router.get('/:id', authMiddleware, async (req, res) => {
 // POST /api/goals
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, kra_id, goal_type, title, description, weight, target_value, metric_type, due_date, status } = req.body;
+    const { employee_id, cycle_id, kra_id, kpi_template_id, goal_type, title, description, weight, target_value, metric_type, due_date, status, calibration, quarter } = req.body;
+    
+    // Validate and format calibration if provided
+    let calibrationJson = null;
+    if (calibration) {
+      if (Array.isArray(calibration)) {
+        calibrationJson = JSON.stringify(calibration);
+      } else if (typeof calibration === 'string') {
+        // Already JSON string, validate it
+        JSON.parse(calibration);
+        calibrationJson = calibration;
+      }
+    }
     
     const result = await query(
-      `INSERT INTO goals (id, employee_id, cycle_id, kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+      `INSERT INTO goals (id, employee_id, cycle_id, kra_id, kpi_template_id, title, description, goal_type, metric_type, target_value, weight, calibration, due_date, status, quarter, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
        RETURNING *`,
       [
         employee_id ?? null,
         cycle_id ?? null,
         kra_id ?? null,
+        kpi_template_id ?? null,
         title ?? null,
         description ?? null,
         goal_type || 'kpi',
         metric_type || 'number',
         target_value ?? null,
         weight ?? null,
+        calibrationJson,
         due_date ?? null,
-        status || 'draft'
+        status || 'draft',
+        quarter ?? null
       ]
     );
     res.status(201).json({ data: result.rows[0] });
@@ -154,35 +183,95 @@ router.post('/', authMiddleware, async (req, res) => {
 // PUT /api/goals/:id
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, manager_comments } = req.body;
+    const { kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, manager_comments, calibration } = req.body;
+    
+    // Check current goal status - calibration can only be edited until manager approval
+    const currentGoal = await query('SELECT status FROM goals WHERE id = $1', [req.params.id]);
+    if (currentGoal.rows.length === 0) {
+      return res.status(404).json({ error: 'Goal not found' });
+    }
+    
+    const currentStatus = currentGoal.rows[0].status;
+    const isLocked = currentStatus === 'approved' || currentStatus === 'locked';
+    
+    // Validate and format calibration if provided
+    let calibrationJson = undefined;
+    if (calibration !== undefined) {
+      if (isLocked) {
+        return res.status(403).json({ error: 'Calibration cannot be modified after manager approval' });
+      }
+      
+      if (calibration === null) {
+        calibrationJson = null;
+      } else if (Array.isArray(calibration)) {
+        calibrationJson = JSON.stringify(calibration);
+      } else if (typeof calibration === 'string') {
+        // Already JSON string, validate it
+        JSON.parse(calibration);
+        calibrationJson = calibration;
+      }
+    }
+    
+    // Build update query dynamically
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+    
+    if (kra_id !== undefined) {
+      updates.push(`kra_id = $${paramIndex++}`);
+      values.push(kra_id ?? null);
+    }
+    if (title !== undefined) {
+      updates.push(`title = $${paramIndex++}`);
+      values.push(title ?? null);
+    }
+    if (description !== undefined) {
+      updates.push(`description = $${paramIndex++}`);
+      values.push(description ?? null);
+    }
+    if (goal_type !== undefined) {
+      updates.push(`goal_type = $${paramIndex++}`);
+      values.push(goal_type ?? null);
+    }
+    if (metric_type !== undefined) {
+      updates.push(`metric_type = $${paramIndex++}`);
+      values.push(metric_type ?? null);
+    }
+    if (target_value !== undefined) {
+      updates.push(`target_value = $${paramIndex++}`);
+      values.push(target_value ?? null);
+    }
+    if (weight !== undefined) {
+      updates.push(`weight = $${paramIndex++}`);
+      values.push(weight ?? null);
+    }
+    if (calibrationJson !== undefined) {
+      updates.push(`calibration = $${paramIndex++}`);
+      values.push(calibrationJson);
+    }
+    if (due_date !== undefined) {
+      updates.push(`due_date = $${paramIndex++}`);
+      values.push(due_date ?? null);
+    }
+    if (status !== undefined) {
+      updates.push(`status = $${paramIndex++}`);
+      values.push(status ?? null);
+    }
+    if (manager_comments !== undefined) {
+      updates.push(`manager_comments = $${paramIndex++}`);
+      values.push(manager_comments ?? null);
+    }
+    
+    updates.push(`updated_at = NOW()`);
+    values.push(req.params.id);
+    
+    if (updates.length === 1) { // Only updated_at
+      return res.status(400).json({ error: 'No fields to update' });
+    }
     
     const result = await query(
-      `UPDATE goals SET
-        kra_id = COALESCE($1, kra_id),
-        title = COALESCE($2, title),
-        description = COALESCE($3, description),
-        goal_type = COALESCE($4, goal_type),
-        metric_type = COALESCE($5, metric_type),
-        target_value = COALESCE($6, target_value),
-        weight = COALESCE($7, weight),
-        due_date = COALESCE($8, due_date),
-        status = COALESCE($9, status),
-        manager_comments = COALESCE($10, manager_comments),
-        updated_at = NOW()
-       WHERE id = $11 RETURNING *`,
-      [
-        kra_id ?? null,
-        title ?? null,
-        description ?? null,
-        goal_type ?? null,
-        metric_type ?? null,
-        target_value ?? null,
-        weight ?? null,
-        due_date ?? null,
-        status ?? null,
-        manager_comments ?? null,
-        req.params.id
-      ]
+      `UPDATE goals SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`,
+      values
     );
     
     if (result.rows.length === 0) {

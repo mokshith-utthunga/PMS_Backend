@@ -90,8 +90,8 @@ router.post('/kra/:id/duplicate', authMiddleware, async (req, res) => {
     const newKpis = [];
     for (const kpi of kpisResult.rows) {
       const kpiResult = await query(
-        `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight, calibration)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING *`,
         [
           newTemplate.id,
@@ -99,7 +99,8 @@ router.post('/kra/:id/duplicate', authMiddleware, async (req, res) => {
           kpi.description,
           kpi.metric_type,
           kpi.suggested_target,
-          kpi.suggested_weight
+          kpi.suggested_weight,
+          kpi.calibration || null
         ]
       );
       newKpis.push(kpiResult.rows[0]);
@@ -166,9 +167,17 @@ router.post('/kra', authMiddleware, async (req, res) => {
     if (kpis && kpis.length > 0) {
       for (const kpi of kpis) {
         await query(
-          `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [template.id, kpi.title, kpi.description, kpi.metric_type || 'number', kpi.suggested_target, kpi.suggested_weight || 50]
+          `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight, calibration)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            template.id, 
+            kpi.title, 
+            kpi.description, 
+            kpi.metric_type || 'number', 
+            kpi.suggested_target, 
+            kpi.suggested_weight || 50,
+            kpi.calibration ? JSON.stringify(kpi.calibration) : null
+          ]
         );
       }
     }
@@ -206,9 +215,17 @@ router.put('/kra/:id', authMiddleware, async (req, res) => {
       // Insert new KPIs
       for (const kpi of kpis) {
         await query(
-          `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [id, kpi.title, kpi.description, kpi.metric_type || 'number', kpi.suggested_target, kpi.suggested_weight || 50]
+          `INSERT INTO kpi_templates (kra_template_id, title, description, metric_type, suggested_target, suggested_weight, calibration)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            id, 
+            kpi.title, 
+            kpi.description, 
+            kpi.metric_type || 'number', 
+            kpi.suggested_target, 
+            kpi.suggested_weight || 50,
+            kpi.calibration ? JSON.stringify(kpi.calibration) : null
+          ]
         );
       }
     }

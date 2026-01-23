@@ -844,6 +844,214 @@ router.post('/employee-accept-rating', authMiddleware, async (req, res) => {
   }
 });
 
+// ========== YEAR-END HR REVIEW WORKFLOW ==========
+
+// GET /api/evaluations/hr-pending-year-end-reviews
+// Get year-end manager evaluations pending HR approval (status = 'submitted' and not yet released)
+router.get('/hr-pending-year-end-reviews', authMiddleware, async (req, res) => {
+  try {
+    const { cycle_id } = req.query;
+    
+    let sql = `
+      SELECT 
+        me.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.department,
+        m.full_name as manager_name,
+        m.emp_code as manager_code,
+        pc.name as cycle_name
+      FROM manager_evaluations me
+      INNER JOIN employees e ON e.id = me.employee_id
+      LEFT JOIN employees m ON m.id = me.evaluator_id
+      INNER JOIN performance_cycles pc ON pc.id = me.cycle_id
+      WHERE me.status = 'submitted' 
+        AND me.released_at IS NULL
+    `;
+    const params = [];
+    let idx = 1;
+
+    if (cycle_id) {
+      sql += ` AND me.cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+
+    sql += ' ORDER BY me.created_at DESC';
+    
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get HR pending year-end reviews error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/hr-approve-year-end-review
+// HR approves a year-end manager evaluation and releases it to employee
+router.post('/hr-approve-year-end-review', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id } = req.body;
+
+    if (!manager_evaluation_id) {
+      return res.status(400).json({ error: 'manager_evaluation_id is required' });
+    }
+
+    // Update manager_evaluations - set released_at to mark HR approval
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET released_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted' AND released_at IS NULL
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Evaluation not found or already approved' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('HR approve year-end review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/hr-reject-year-end-review
+// HR rejects a year-end manager evaluation (sends back to manager)
+router.post('/hr-reject-year-end-review', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id, rejection_reason } = req.body;
+
+    if (!manager_evaluation_id || !rejection_reason) {
+      return res.status(400).json({ error: 'manager_evaluation_id and rejection_reason are required' });
+    }
+
+    // Update status back to pending for manager to revise
+    // Store rejection reason in overall_comments or development_recommendations temporarily
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET status = 'pending',
+           released_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted'
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Evaluation not found or already processed' });
+    }
+
+    res.json({ data: result.rows[0], rejection_reason });
+  } catch (error) {
+    console.error('HR reject year-end review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/employee-accept-year-end-rating
+// Employee accepts their year-end rating
+router.post('/employee-accept-year-end-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id } = req.body;
+    const userId = req.user?.userId;
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_evaluation_id) {
+      return res.status(400).json({ error: 'manager_evaluation_id is required' });
+    }
+
+    // Get employee_id from user
+    const empResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    // Mark acknowledged_at in manager_evaluations
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET acknowledged_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1 AND released_at IS NOT NULL
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Evaluation not found or not yet released by HR' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Employee accept year-end rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/employee-reject-year-end-rating
+// Employee rejects their year-end rating
+router.post('/employee-reject-year-end-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id, rejection_reason, cycle_id } = req.body;
+    const userId = req.user?.userId;
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_evaluation_id || !rejection_reason || !cycle_id) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    // Get employee_id from user
+    const empResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Create rating rejection for year-end (quarter = NULL)
+    const rejectionResult = await query(
+      `INSERT INTO rating_rejections 
+       (id, employee_id, cycle_id, quarter, manager_review_id, rejection_reason, status, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'pending', NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
+         rejection_reason = EXCLUDED.rejection_reason,
+         status = 'pending',
+         updated_at = NOW()
+       RETURNING *`,
+      [employeeId, cycle_id, manager_evaluation_id, rejection_reason]
+    );
+
+    // Store acknowledgment_comments with rejection reason
+    await query(
+      `UPDATE manager_evaluations 
+       SET acknowledgment_comments = $2,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [manager_evaluation_id, `Rejected: ${rejection_reason}`]
+    );
+
+    res.json({ data: rejectionResult.rows[0] });
+  } catch (error) {
+    console.error('Employee reject year-end rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/evaluations/rating-rejections
 // Get rating rejections (for HR/Admin/BU Head)
 router.get('/rating-rejections', authMiddleware, async (req, res) => {
