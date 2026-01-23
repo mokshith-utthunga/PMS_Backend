@@ -7,30 +7,78 @@ const router = express.Router();
 
 router.get('/late-submission', authMiddleware, requireRole(['hr_admin', 'system_admin']), async (req, res) => {
   try {
-    const { employee_id, cycle_id, revoked_at, quarter = 1 } = req.query;
+    const { employee_id, cycle_id, revoked_at, quarter = 1, type = 'goals' } = req.query;
     
     // If cycle_id is provided, get employees who haven't submitted + existing permissions
     if (cycle_id) {
       const isYearEnd = quarter === 'year-end';
       const quarterNum = isYearEnd ? null : (parseInt(quarter) || 1);
       
-      // Get cycle dates - for year-end, get self_evaluation dates; for quarters, get quarter dates
-      const cycleResult = await query(
-        `SELECT q1_self_review_start, q1_self_review_end,
-                q2_self_review_start, q2_self_review_end,
-                q3_self_review_start, q3_self_review_end,
-                q4_self_review_start, q4_self_review_end,
-                self_evaluation_start, self_evaluation_end
-         FROM performance_cycles WHERE id = $1`,
-        [cycle_id]
-      );
+      // Get dates based on type (goals or evaluations)
+      let startDate = null;
       
-      if (cycleResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Cycle not found' });
+      if (isYearEnd) {
+        // Get year-end dates from Q4 quarterly_cycles (manager review dates are used for year-end)
+        const q4Result = await query(
+          `SELECT manager_review_start_date, manager_review_end_date FROM quarterly_cycles WHERE performance_cycle_id = $1 AND quarter = 4`,
+          [cycle_id]
+        );
+        
+        if (q4Result.rows.length === 0) {
+          // Check if cycle exists
+          const cycleExistsResult = await query(
+            `SELECT id FROM performance_cycles WHERE id = $1`,
+            [cycle_id]
+          );
+          if (cycleExistsResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Cycle not found' });
+          }
+        } else {
+          startDate = q4Result.rows[0].manager_review_start_date;
+        }
+      } else if (type === 'goals') {
+        // Get goal dates from goals_quarterly_cycles table
+        const gqcResult = await query(
+          `SELECT goal_submission_start_date, goal_submission_end_date 
+           FROM goals_quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarterNum]
+        );
+        
+        if (gqcResult.rows.length > 0) {
+          startDate = gqcResult.rows[0].goal_submission_start_date;
+        } else {
+          // Check if cycle exists
+          const cycleExistsResult = await query(
+            `SELECT id FROM performance_cycles WHERE id = $1`,
+            [cycle_id]
+          );
+          if (cycleExistsResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Cycle not found' });
+          }
+        }
+      } else {
+        // Get evaluation dates from quarterly_cycles table
+        const qcResult = await query(
+          `SELECT self_review_start_date, self_review_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarterNum]
+        );
+        
+        if (qcResult.rows.length > 0) {
+          startDate = qcResult.rows[0].self_review_start_date;
+        } else {
+          // Check if cycle exists
+          const cycleExistsResult = await query(
+            `SELECT id FROM performance_cycles WHERE id = $1`,
+            [cycle_id]
+          );
+          if (cycleExistsResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Cycle not found' });
+          }
+        }
       }
-      
-      const cycle = cycleResult.rows[0];
-      const startDate = isYearEnd ? cycle.self_evaluation_start : cycle[`q${quarterNum}_self_review_start`];
       
       // Get all active employees who joined BEFORE or ON the start date
       // Employees who joined after the period started should not be shown as "missed deadline"
@@ -415,11 +463,12 @@ router.put('/late-submission/:cycleId/:employeeId/revoke', authMiddleware, requi
   }
 });
 
-// GET /api/permissions/late-submission-details - Get late submission statistics
+// GET /api/permissions/late-submission-details - Get late submission statistics (Unified for Goals + Evaluations)
+// Accepts optional 'type' parameter: 'goals' | 'evaluations' to determine which dates to check for quarter accessibility
 // Restricted to HR Admin and System Admin
 router.get('/late-submission-details', authMiddleware, requireRole(['hr_admin', 'system_admin']), async (req, res) => {
   try {
-    const { cycle_id, quarter } = req.query;
+    const { cycle_id, quarter, type = 'goals' } = req.query;
     
     if (!cycle_id) {
       return res.status(400).json({ error: 'cycle_id is required' });
@@ -428,17 +477,13 @@ router.get('/late-submission-details', authMiddleware, requireRole(['hr_admin', 
     // Parse quarter - handle "year-end" as special case
     const isYearEnd = quarter === 'year-end';
     const quarterNum = isYearEnd ? null : (quarter ? parseInt(quarter) : 1);
-    if (!isYearEnd && quarterNum < 1 || quarterNum > 4) {
+    if (!isYearEnd && (quarterNum < 1 || quarterNum > 4)) {
       return res.status(400).json({ error: 'quarter must be between 1 and 4, or "year-end"' });
     }
 
-    // Get cycle dates - for year-end, get self_evaluation dates; for quarters, get quarter dates
+    // Get performance cycle basic info
     const cycleResult = await query(
-      `SELECT q1_self_review_start, q1_self_review_end,
-              q2_self_review_start, q2_self_review_end,
-              q3_self_review_start, q3_self_review_end,
-              q4_self_review_start, q4_self_review_end,
-              self_evaluation_start, self_evaluation_end
+      `SELECT id, year, allow_late_goal_submission
        FROM performance_cycles 
        WHERE id = $1`,
       [cycle_id]
@@ -452,107 +497,209 @@ router.get('/late-submission-details', authMiddleware, requireRole(['hr_admin', 
     const now = new Date();
     now.setHours(0, 0, 0, 0);
 
-    // Validate: Check if the requested period has started
-    const startDate = isYearEnd ? cycle.self_evaluation_start : cycle[`q${quarterNum}_self_review_start`];
-    
-    if (!startDate) {
-      return res.status(400).json({ 
-        error: isYearEnd 
-          ? 'Cannot access year-end evaluation. Year-end evaluation start date is not configured.' 
-          : `Cannot access Q${quarterNum}. Quarter start date is not configured.` 
-      });
-    }
-    
-    // Parse the date
-    let requestedStart;
-    if (startDate instanceof Date) {
-      requestedStart = new Date(startDate);
+    // ========== EVALUATIONS LOGIC ==========
+    // Get evaluation dates from quarterly_cycles table
+    let evalStartDate, evalEndDate;
+    if (isYearEnd) {
+      // For year-end evaluations, use Q4's dates from quarterly_cycles
+      const q4Result = await query(
+        `SELECT self_review_start_date, self_review_end_date, manager_review_start_date, manager_review_end_date 
+         FROM quarterly_cycles 
+         WHERE performance_cycle_id = $1 AND quarter = 4`,
+        [cycle_id]
+      );
+      if (q4Result.rows.length > 0) {
+        // Use Q4's manager review dates for year-end evaluation
+        evalStartDate = q4Result.rows[0].manager_review_start_date;
+        evalEndDate = q4Result.rows[0].manager_review_end_date;
+      }
     } else {
-      requestedStart = new Date(startDate);
-    }
-    requestedStart.setHours(0, 0, 0, 0);
-    
-    // Only allow access if the period has started
-    if (now < requestedStart) {
-      return res.status(400).json({ 
-        error: isYearEnd
-          ? `Cannot access year-end evaluation. Year-end evaluation has not started yet. It starts on ${requestedStart.toISOString().split('T')[0]}.`
-          : `Cannot access Q${quarterNum}. This quarter has not started yet. Quarter starts on ${requestedStart.toISOString().split('T')[0]}. Only quarters that have started are accessible.` 
-      });
+      // Get from quarterly_cycles table
+      const qcResult = await query(
+        `SELECT self_review_start_date, self_review_end_date 
+         FROM quarterly_cycles 
+         WHERE performance_cycle_id = $1 AND quarter = $2`,
+        [cycle_id, quarterNum]
+      );
+      
+      if (qcResult.rows.length > 0) {
+        evalStartDate = qcResult.rows[0].self_review_start_date;
+        evalEndDate = qcResult.rows[0].self_review_end_date;
+      }
     }
 
-    const endDate = isYearEnd ? cycle.self_evaluation_end : cycle[`q${quarterNum}_self_review_end`];
-    
-    // Check if deadline has passed
-    let isPastDeadline = false;
-    if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999); // End of day
-      isPastDeadline = now > end;
+    // ========== GOALS LOGIC ==========
+    // Get goals dates from goals_quarterly_cycles table
+    let goalsStartDate, goalsEndDate, allowLateGoals;
+    if (!isYearEnd) {
+      // Get from goals_quarterly_cycles table
+      const gqcResult = await query(
+        `SELECT goal_submission_start_date, goal_submission_end_date, allow_late_goal_submission 
+         FROM goals_quarterly_cycles 
+         WHERE performance_cycle_id = $1 AND quarter = $2`,
+        [cycle_id, quarterNum]
+      );
+      
+      if (gqcResult.rows.length > 0) {
+        goalsStartDate = gqcResult.rows[0].goal_submission_start_date;
+        goalsEndDate = gqcResult.rows[0].goal_submission_end_date;
+        allowLateGoals = gqcResult.rows[0].allow_late_goal_submission;
+      } else {
+        // Use global allow_late_goal_submission from performance_cycles
+        allowLateGoals = cycle.allow_late_goal_submission;
+      }
+    } else {
+      // Year-end: get Q4 goals dates
+      const q4GoalsResult = await query(
+        `SELECT goal_submission_start_date, goal_submission_end_date, allow_late_goal_submission 
+         FROM goals_quarterly_cycles 
+         WHERE performance_cycle_id = $1 AND quarter = 4`,
+        [cycle_id]
+      );
+      
+      if (q4GoalsResult.rows.length > 0) {
+        goalsStartDate = q4GoalsResult.rows[0].goal_submission_start_date;
+        goalsEndDate = q4GoalsResult.rows[0].goal_submission_end_date;
+        allowLateGoals = q4GoalsResult.rows[0].allow_late_goal_submission;
+      } else {
+        allowLateGoals = cycle.allow_late_goal_submission;
+      }
+    }
+
+    // ========== DETERMINE IF PERIODS HAVE STARTED ==========
+    // Check if goals period has started
+    let goalsHasStarted = false;
+    if (goalsStartDate) {
+      const goalsStart = new Date(goalsStartDate);
+      goalsStart.setHours(0, 0, 0, 0);
+      goalsHasStarted = now >= goalsStart;
+    }
+
+    // Check if evaluations period has started
+    let evalHasStarted = false;
+    if (evalStartDate) {
+      const evalStart = new Date(evalStartDate);
+      evalStart.setHours(0, 0, 0, 0);
+      evalHasStarted = now >= evalStart;
+    }
+
+    // Calculate isPastDeadline for both types
+    let evalIsPastDeadline = false;
+    if (evalEndDate) {
+      const evalEnd = new Date(evalEndDate);
+      evalEnd.setHours(23, 59, 59, 999);
+      evalIsPastDeadline = now > evalEnd;
+    }
+
+    let goalsIsPastDeadline = false;
+    if (goalsEndDate) {
+      const goalsEnd = new Date(goalsEndDate);
+      goalsEnd.setHours(23, 59, 59, 999);
+      goalsIsPastDeadline = now > goalsEnd;
     }
 
     // Total employees: Count of employees who were part of the organization at the start
+    // Use the earlier of goals or evaluations start date
+    const overallStartDate = goalsStartDate && evalStartDate 
+      ? (new Date(goalsStartDate) < new Date(evalStartDate) ? goalsStartDate : evalStartDate)
+      : (goalsStartDate || evalStartDate);
+
     const totalEmployeesResult = await query(
       `SELECT COUNT(*) as count FROM employees 
-       WHERE status = 'active' ${startDate ? `AND date_of_joining <= $1` : ''}`,
-      startDate ? [startDate] : []
+       WHERE status = 'active' ${overallStartDate ? `AND date_of_joining <= $1` : ''}`,
+      overallStartDate ? [overallStartDate] : []
     );
     const totalEmployees = parseInt(totalEmployeesResult.rows[0]?.count || 0);
 
-    // Submitted: Count of employees who have submitted their evaluations
-    let submittedResult;
+    // ========== EVALUATIONS STATS ==========
+    let evalSubmittedResult;
     if (isYearEnd) {
-      submittedResult = await query(
+      evalSubmittedResult = await query(
         `SELECT COUNT(DISTINCT se.employee_id) as count 
          FROM self_evaluations se
          JOIN employees e ON e.id = se.employee_id
          WHERE se.cycle_id = $1 AND se.quarter IS NULL AND se.status = 'submitted'
-         ${startDate ? `AND e.date_of_joining <= $2` : ''}`,
-        startDate ? [cycle_id, startDate] : [cycle_id]
+         ${evalStartDate ? `AND e.date_of_joining <= $2` : ''}`,
+        evalStartDate ? [cycle_id, evalStartDate] : [cycle_id]
       );
     } else {
-      submittedResult = await query(
+      evalSubmittedResult = await query(
         `SELECT COUNT(DISTINCT qsr.employee_id) as count 
          FROM quarterly_self_reviews qsr
          JOIN employees e ON e.id = qsr.employee_id
          WHERE qsr.cycle_id = $1 AND qsr.quarter = $2 AND qsr.status = 'submitted'
-         ${startDate ? `AND e.date_of_joining <= $3` : ''}`,
-        startDate ? [cycle_id, quarterNum, startDate] : [cycle_id, quarterNum]
+         ${evalStartDate ? `AND e.date_of_joining <= $3` : ''}`,
+        evalStartDate ? [cycle_id, quarterNum, evalStartDate] : [cycle_id, quarterNum]
       );
     }
-    const submitted = parseInt(submittedResult.rows[0]?.count || 0);
+    const evalSubmitted = parseInt(evalSubmittedResult.rows[0]?.count || 0);
+    const evalMissedDeadline = evalIsPastDeadline ? (totalEmployees - evalSubmitted) : 0;
 
-    // Missed Deadline: totalEmployees - submitted (only if deadline has passed)
-    const missedDeadline = isPastDeadline ? (totalEmployees - submitted) : 0;
-
-    // Late Access Granted: Count of employees who have been granted late submission permissions
-    // For year-end, check for NULL quarter; for quarters, check for specific quarter or NULL
-    let lateAccessGrantedResult;
+    // Late access for evaluations
+    let evalLateAccessResult;
     if (isYearEnd) {
-      lateAccessGrantedResult = await query(
+      evalLateAccessResult = await query(
         `SELECT COUNT(*) as count 
          FROM late_submission_permissions 
          WHERE cycle_id = $1 AND revoked_at IS NULL AND quarter IS NULL`,
         [cycle_id]
       );
     } else {
-      lateAccessGrantedResult = await query(
+      evalLateAccessResult = await query(
         `SELECT COUNT(*) as count 
          FROM late_submission_permissions 
          WHERE cycle_id = $1 AND revoked_at IS NULL AND (quarter = $2 OR quarter IS NULL)`,
         [cycle_id, quarterNum]
       );
     }
-    const lateAccessGranted = parseInt(lateAccessGrantedResult.rows[0]?.count || 0);
+    const evalLateAccessGranted = parseInt(evalLateAccessResult.rows[0]?.count || 0);
+
+    // ========== GOALS STATS ==========
+    // Count employees who have submitted goals (status = 'submitted' or 'approved')
+    const goalsSubmittedResult = await query(
+      `SELECT COUNT(DISTINCT g.employee_id) as count 
+       FROM goals g
+       JOIN employees e ON e.id = g.employee_id
+       WHERE g.cycle_id = $1 AND g.status IN ('submitted', 'approved')
+       ${goalsStartDate ? `AND e.date_of_joining <= $2` : ''}`,
+      goalsStartDate ? [cycle_id, goalsStartDate] : [cycle_id]
+    );
+    const goalsSubmitted = parseInt(goalsSubmittedResult.rows[0]?.count || 0);
+    const goalsMissedDeadline = goalsIsPastDeadline ? (totalEmployees - goalsSubmitted) : 0;
+
+    // Late access for goals - count actual individual permissions granted
+    // Note: allow_late_goal_submission is a global toggle (returned separately if needed)
+    // lateAccessGranted counts actual explicit permissions from late_submission_permissions table
+    const goalsLateAccessResult = await query(
+      `SELECT COUNT(*) as count 
+       FROM late_submission_permissions 
+       WHERE cycle_id = $1 AND revoked_at IS NULL ${isYearEnd ? 'AND quarter IS NULL' : `AND (quarter = $2 OR quarter IS NULL)`}`,
+      isYearEnd ? [cycle_id] : [cycle_id, quarterNum]
+    );
+    const goalsLateAccessGranted = parseInt(goalsLateAccessResult.rows[0]?.count || 0);
 
     res.json({
       data: {
         totalEmployees,
-        submitted,
-        missedDeadline,
-        lateAccessGranted,
-        quarter: isYearEnd ? 'year-end' : quarterNum,
-        isPastDeadline,
+        goals: {
+          submitted: goalsHasStarted ? goalsSubmitted : 0,
+          missedDeadline: goalsHasStarted ? goalsMissedDeadline : 0,
+          lateAccessGranted: goalsHasStarted ? goalsLateAccessGranted : 0,
+          allowLateSubmission: allowLateGoals || false, // Global toggle from goals_quarterly_cycles
+          quarter: isYearEnd ? null : quarterNum,
+          isPastDeadline: goalsIsPastDeadline,
+          hasStarted: goalsHasStarted,
+          startDate: goalsStartDate || null,
+        },
+        evaluations: {
+          submitted: evalHasStarted ? evalSubmitted : 0,
+          missedDeadline: evalHasStarted ? evalMissedDeadline : 0,
+          lateAccessGranted: evalHasStarted ? evalLateAccessGranted : 0,
+          quarter: isYearEnd ? null : quarterNum,
+          isPastDeadline: evalIsPastDeadline,
+          hasStarted: evalHasStarted,
+          startDate: evalStartDate || null,
+        }
       }
     });
   } catch (error) {

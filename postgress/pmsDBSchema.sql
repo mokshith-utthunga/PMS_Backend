@@ -220,6 +220,7 @@ CREATE TABLE public.goals (
         weight > 0
         AND weight <= 100
     ),
+    calibration JSONB DEFAULT NULL,
     due_date DATE,
     status goal_status NOT NULL DEFAULT 'draft',
     manager_comments TEXT,
@@ -552,6 +553,7 @@ CREATE TABLE public.kpi_templates (
     metric_type metric_type NOT NULL DEFAULT 'number',
     suggested_target TEXT,
     suggested_weight INTEGER NOT NULL DEFAULT 50,
+    calibration JSONB DEFAULT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
