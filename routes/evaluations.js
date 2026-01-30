@@ -1,7 +1,8 @@
 import express from 'express';
 import { query } from '../config/database.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 import { checkManagerOrDelegate } from './delegations.js';
+import { normalizeRatings } from '../services/normalizationService.js';
 
 const router = express.Router();
 
@@ -1227,6 +1228,355 @@ router.get('/rating-rejections', authMiddleware, async (req, res) => {
     res.json({ data: result.rows });
   } catch (error) {
     console.error('Get rating rejections error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== NORMALIZED RATINGS WORKFLOW ==========
+
+// POST /api/hr/normalize?quarter=QX&cycle_id=UUID
+// Normalize ratings for a quarter using Box-Cox transform
+router.post('/hr/normalize', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { quarter, cycle_id } = req.query;
+    const userId = req.user?.userId;
+    
+    if (!quarter || !cycle_id) {
+      return res.status(400).json({ error: 'quarter and cycle_id are required' });
+    }
+    
+    const quarterNum = parseInt(quarter);
+    if (quarterNum < 1 || quarterNum > 4) {
+      return res.status(400).json({ error: 'quarter must be between 1 and 4' });
+    }
+    
+    const result = await normalizeRatings(quarterNum, cycle_id, userId);
+    res.json({ data: result });
+  } catch (error) {
+    console.error('Normalize ratings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/hr/normalized-ratings?quarter=QX&cycle_id=UUID&status=...
+// Get normalized ratings with filters
+router.get('/hr/normalized-ratings', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { quarter, cycle_id, status } = req.query;
+    
+    let sql = `
+      SELECT 
+        nr.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.grade,
+        m.full_name as manager_name,
+        m.emp_code as manager_code,
+        p.full_name as updated_by_hr_name
+      FROM normalized_ratings nr
+      JOIN employees e ON e.id = nr.employee_id
+      JOIN employees m ON m.id = nr.manager_id
+      LEFT JOIN profiles p ON p.id = nr.updated_by_hr
+      WHERE 1=1
+    `;
+    const params = [];
+    let idx = 1;
+    
+    if (cycle_id) {
+      sql += ` AND nr.performance_cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+    if (quarter) {
+      sql += ` AND nr.quarter = $${idx++}`;
+      params.push(parseInt(quarter));
+    }
+    if (status) {
+      sql += ` AND nr.status = $${idx++}`;
+      params.push(status);
+    }
+    
+    sql += ' ORDER BY nr.updated_at DESC';
+    
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get normalized ratings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/hr/send-to-manager
+// Send normalized ratings to manager for review
+router.post('/hr/send-to-manager', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { employeeIds, quarter, cycleId } = req.body;
+    const userId = req.user?.userId;
+    
+    if (!employeeIds || !Array.isArray(employeeIds) || employeeIds.length === 0) {
+      return res.status(400).json({ error: 'employeeIds array is required' });
+    }
+    if (!quarter || !cycleId) {
+      return res.status(400).json({ error: 'quarter and cycleId are required' });
+    }
+    
+    // Update status to SENT_TO_MANAGER
+    const placeholders = employeeIds.map((_, i) => `$${i + 1}`).join(', ');
+    const updateQuery = `
+      UPDATE normalized_ratings
+      SET status = 'SENT_TO_MANAGER',
+          updated_at = NOW()
+      WHERE employee_id IN (${placeholders})
+        AND performance_cycle_id = $${employeeIds.length + 1}
+        AND quarter = $${employeeIds.length + 2}
+        AND status IN ('DRAFT', 'REJECTED')
+      RETURNING *
+    `;
+    const updateParams = [...employeeIds, cycleId, parseInt(quarter)];
+    const updateResult = await query(updateQuery, updateParams);
+    
+    // Log to history
+    for (const row of updateResult.rows) {
+      await query(
+        `INSERT INTO rating_review_history (employee_id, quarter, cycle_id, old_value, new_value, action, acted_by)
+         VALUES ($1, $2, $3, $4, $5, 'SEND', $6)`,
+        [row.employee_id, row.quarter, row.performance_cycle_id, row.final_normalized_rating, row.final_normalized_rating, userId]
+      );
+    }
+    
+    res.json({ data: updateResult.rows, count: updateResult.rows.length });
+  } catch (error) {
+    console.error('Send to manager error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/manager/review
+// Manager accepts or rejects normalized rating
+router.post('/manager/review', authMiddleware, async (req, res) => {
+  try {
+    const { employeeId, quarter, cycleId, action } = req.body;
+    const userId = req.user?.userId;
+    
+    if (!employeeId || !quarter || !cycleId || !action) {
+      return res.status(400).json({ error: 'employeeId, quarter, cycleId, and action are required' });
+    }
+    
+    if (!['ACCEPT', 'REJECT'].includes(action)) {
+      return res.status(400).json({ error: 'action must be ACCEPT or REJECT' });
+    }
+    
+    // Verify manager has access to this employee
+    const managerCheck = await query(
+      `SELECT nr.id, nr.final_normalized_rating, nr.status
+       FROM normalized_ratings nr
+       JOIN employees e ON e.id = nr.employee_id
+       JOIN employees m ON m.id = nr.manager_id
+       JOIN profiles p ON p.id = m.profile_id
+       WHERE nr.employee_id = $1
+         AND nr.performance_cycle_id = $2
+         AND nr.quarter = $3
+         AND nr.status = 'SENT_TO_MANAGER'
+         AND p.id = $4`,
+      [employeeId, cycleId, parseInt(quarter), userId]
+    );
+    
+    if (managerCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Not authorized or rating not found' });
+    }
+    
+    const rating = managerCheck.rows[0];
+    const newStatus = action === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED';
+    
+    // Update status
+    const updateResult = await query(
+      `UPDATE normalized_ratings
+       SET status = $1, updated_at = NOW()
+       WHERE employee_id = $2
+         AND performance_cycle_id = $3
+         AND quarter = $4
+         AND status = 'SENT_TO_MANAGER'
+       RETURNING *`,
+      [newStatus, employeeId, cycleId, parseInt(quarter)]
+    );
+    
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Rating not found or already processed' });
+    }
+    
+    // Log to history
+    await query(
+      `INSERT INTO rating_review_history (employee_id, quarter, cycle_id, old_value, new_value, action, acted_by)
+       VALUES ($1, $2, $3, $4, $4, $5, $6)`,
+      [employeeId, parseInt(quarter), cycleId, rating.final_normalized_rating, action, userId]
+    );
+    
+    res.json({ data: updateResult.rows[0] });
+  } catch (error) {
+    console.error('Manager review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/manager/normalized-ratings?manager_id=UUID&quarter=QX&cycle_id=UUID
+// Get normalized ratings for manager's team
+router.get('/manager/normalized-ratings', authMiddleware, async (req, res) => {
+  try {
+    const { manager_id, quarter, cycle_id } = req.query;
+    const userId = req.user?.userId;
+    
+    // Verify manager access
+    let managerId = manager_id;
+    if (!managerId) {
+      // Get manager_id from current user
+      const empResult = await query(
+        'SELECT id FROM employees WHERE profile_id = $1',
+        [userId]
+      );
+      if (empResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Employee record not found' });
+      }
+      managerId = empResult.rows[0].id;
+    }
+    
+    let sql = `
+      SELECT 
+        nr.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.grade
+      FROM normalized_ratings nr
+      JOIN employees e ON e.id = nr.employee_id
+      WHERE nr.manager_id = $1
+        AND nr.status = 'SENT_TO_MANAGER'
+    `;
+    const params = [managerId];
+    let idx = 2;
+    
+    if (cycle_id) {
+      sql += ` AND nr.performance_cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+    if (quarter) {
+      sql += ` AND nr.quarter = $${idx++}`;
+      params.push(parseInt(quarter));
+    }
+    
+    sql += ' ORDER BY e.full_name';
+    
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get manager normalized ratings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/hr/publish
+// Publish normalized ratings (make visible to employees)
+router.post('/hr/publish', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { employeeIds, quarter, cycleId } = req.body;
+    const userId = req.user?.userId;
+    
+    if (!employeeIds || !Array.isArray(employeeIds) || employeeIds.length === 0) {
+      return res.status(400).json({ error: 'employeeIds array is required' });
+    }
+    if (!quarter || !cycleId) {
+      return res.status(400).json({ error: 'quarter and cycleId are required' });
+    }
+    
+    // Update status to PUBLISHED and copy to quarterly_manager_reviews
+    const placeholders = employeeIds.map((_, i) => `$${i + 1}`).join(', ');
+    const updateQuery = `
+      UPDATE normalized_ratings
+      SET status = 'PUBLISHED',
+          updated_at = NOW()
+      WHERE employee_id IN (${placeholders})
+        AND performance_cycle_id = $${employeeIds.length + 1}
+        AND quarter = $${employeeIds.length + 2}
+        AND status = 'ACCEPTED'
+      RETURNING *
+    `;
+    const updateParams = [...employeeIds, cycleId, parseInt(quarter)];
+    const updateResult = await query(updateQuery, updateParams);
+    
+    // Copy final_normalized_rating to quarterly_manager_reviews.calculated_overall_rating
+    // Also set hr_approved_at so employees can see the rating
+    for (const row of updateResult.rows) {
+      await query(
+        `UPDATE quarterly_manager_reviews
+         SET calculated_overall_rating = $1,
+             hr_approved_at = NOW(),
+             hr_approved_by = $5,
+             updated_at = NOW()
+         WHERE employee_id = $2
+           AND cycle_id = $3
+           AND quarter = $4`,
+        [row.final_normalized_rating, row.employee_id, row.performance_cycle_id, row.quarter, userId]
+      );
+      
+      // Log to history
+      await query(
+        `INSERT INTO rating_review_history (employee_id, quarter, cycle_id, old_value, new_value, action, acted_by)
+         VALUES ($1, $2, $3, $4, $5, 'PUBLISH', $6)`,
+        [row.employee_id, row.quarter, row.performance_cycle_id, row.final_normalized_rating, row.final_normalized_rating, userId]
+      );
+    }
+    
+    res.json({ data: updateResult.rows, count: updateResult.rows.length });
+  } catch (error) {
+    console.error('Publish ratings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/hr/normalized-rating/:id
+// Update normalized rating (for REJECTED status)
+router.put('/hr/normalized-rating/:id', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { final_normalized_rating } = req.body;
+    const userId = req.user?.userId;
+    
+    if (final_normalized_rating === undefined || final_normalized_rating === null) {
+      return res.status(400).json({ error: 'final_normalized_rating is required' });
+    }
+    
+    // Get current rating
+    const currentResult = await query(
+      'SELECT * FROM normalized_ratings WHERE id = $1 AND status = $2',
+      [id, 'REJECTED']
+    );
+    
+    if (currentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Rating not found or not in REJECTED status' });
+    }
+    
+    const current = currentResult.rows[0];
+    const oldValue = current.final_normalized_rating;
+    
+    // Update rating and reset status to DRAFT
+    const updateResult = await query(
+      `UPDATE normalized_ratings
+       SET final_normalized_rating = $1,
+           status = 'DRAFT',
+           updated_by_hr = $2,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [final_normalized_rating, userId, id]
+    );
+    
+    // Log to history
+    await query(
+      `INSERT INTO rating_review_history (employee_id, quarter, cycle_id, old_value, new_value, action, acted_by)
+       VALUES ($1, $2, $3, $4, $5, 'EDIT', $6)`,
+      [current.employee_id, current.quarter, current.performance_cycle_id, oldValue, final_normalized_rating, userId]
+    );
+    
+    res.json({ data: updateResult.rows[0] });
+  } catch (error) {
+    console.error('Update normalized rating error:', error);
     res.status(500).json({ error: error.message });
   }
 });
