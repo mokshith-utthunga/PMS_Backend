@@ -1,6 +1,7 @@
 import express from 'express';
 import { query } from '../config/database.js';
 import { authMiddleware, requireRole } from '../middleware/auth.js';
+import { checkManagerOrDelegate } from './delegations.js';
 
 const router = express.Router();
 
@@ -136,6 +137,55 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     }
     res.json({ message: 'KRA deleted' });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/kras/:id/revoke - Revoke (delete) approved KRA
+router.post('/:id/revoke', authMiddleware, async (req, res) => {
+  try {
+    // Get KRA details including employee_id, cycle_id, quarter, and status
+    const kraResult = await query(
+      'SELECT employee_id, cycle_id, quarter, status FROM kras WHERE id = $1',
+      [req.params.id]
+    );
+    
+    if (kraResult.rows.length === 0) {
+      return res.status(404).json({ error: 'KRA not found' });
+    }
+    
+    const kra = kraResult.rows[0];
+    
+    // Only allow revoking approved KRAs
+    if (kra.status !== 'approved') {
+      return res.status(400).json({ error: 'Only approved KRAs can be revoked' });
+    }
+    
+    // Check if user is manager or delegate
+    const auth = await checkManagerOrDelegate(
+      req.user.userId,
+      kra.employee_id,
+      kra.cycle_id,
+      kra.quarter
+    );
+    
+    if (!auth.isAuthorized) {
+      return res.status(403).json({ error: 'Not authorized to revoke this KRA' });
+    }
+    
+    // Delete the KRA (this will cascade delete associated KPIs due to ON DELETE CASCADE)
+    const result = await query(
+      'DELETE FROM kras WHERE id = $1 RETURNING id',
+      [req.params.id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'KRA not found' });
+    }
+    
+    res.json({ message: 'Approved KRA revoked and deleted successfully' });
+  } catch (error) {
+    console.error('Revoke KRA error:', error);
     res.status(500).json({ error: error.message });
   }
 });

@@ -134,6 +134,136 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
   }
 });
 
+// POST /api/goals/clone - Clone goals from one quarter to another
+// IMPORTANT: This must be defined BEFORE /:id route to avoid matching "clone" as an ID
+router.post('/clone', authMiddleware, async (req, res) => {
+  try {
+    const { employee_id, cycle_id, source_quarter, target_quarter } = req.body;
+
+    if (!employee_id || !cycle_id || !source_quarter || !target_quarter) {
+      return res.status(400).json({ error: 'Missing required fields: employee_id, cycle_id, source_quarter, target_quarter' });
+    }
+
+    if (source_quarter === target_quarter) {
+      return res.status(400).json({ error: 'Source and target quarters must be different' });
+    }
+
+    if (source_quarter < 1 || source_quarter > 4 || target_quarter < 1 || target_quarter > 4) {
+      return res.status(400).json({ error: 'Quarter must be between 1 and 4' });
+    }
+
+    // Check if target quarter already has goals
+    const existingGoals = await query(
+      `SELECT g.id FROM goals g
+       INNER JOIN kras k ON g.kra_id = k.id
+       WHERE k.employee_id = $1 AND k.cycle_id = $2 AND k.quarter = $3`,
+      [employee_id, cycle_id, target_quarter]
+    );
+
+    if (existingGoals.rows.length > 0) {
+      return res.status(400).json({ error: `Target quarter (Q${target_quarter}) already has goals. Please delete existing goals before cloning.` });
+    }
+
+    // Get all KRAs from source quarter
+    const sourceKRAs = await query(
+      'SELECT * FROM kras WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3',
+      [employee_id, cycle_id, source_quarter]
+    );
+
+    if (sourceKRAs.rows.length === 0) {
+      return res.status(404).json({ error: `No goals found in source quarter (Q${source_quarter})` });
+    }
+
+    const clonedKRAs = [];
+    const clonedKPIs = [];
+
+    // Clone each KRA and its KPIs
+    for (const sourceKRA of sourceKRAs.rows) {
+      // Create new KRA for target quarter
+      const newKRA = await query(
+        `INSERT INTO kras (id, employee_id, cycle_id, kra_template_id, title, description, weight, status, quarter, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+         RETURNING *`,
+        [
+          sourceKRA.employee_id,
+          sourceKRA.cycle_id,
+          sourceKRA.kra_template_id,
+          sourceKRA.title,
+          sourceKRA.description,
+          sourceKRA.weight,
+          'draft', // Reset status to draft for cloned KRA
+          target_quarter
+        ]
+      );
+
+      const clonedKRA = newKRA.rows[0];
+      clonedKRAs.push(clonedKRA);
+
+      // Get all KPIs for this KRA from source quarter
+      const sourceKPIs = await query(
+        'SELECT * FROM goals WHERE kra_id = $1 AND quarter = $2',
+        [sourceKRA.id, source_quarter]
+      );
+
+      // Clone each KPI
+      for (const sourceKPI of sourceKPIs.rows) {
+        // Handle calibration data - PostgreSQL JSONB returns as object, need to stringify for INSERT
+        let calibrationJson = null;
+        if (sourceKPI.calibration !== null && sourceKPI.calibration !== undefined) {
+          if (typeof sourceKPI.calibration === 'string') {
+            // Already a JSON string, validate it
+            try {
+              JSON.parse(sourceKPI.calibration);
+              calibrationJson = sourceKPI.calibration;
+            } catch (e) {
+              // Invalid JSON string, set to null
+              calibrationJson = null;
+            }
+          } else {
+            // PostgreSQL JSONB returns as object/array, convert to JSON string
+            calibrationJson = JSON.stringify(sourceKPI.calibration);
+          }
+        }
+
+        const newKPI = await query(
+          `INSERT INTO goals (id, employee_id, cycle_id, kra_id, kpi_template_id, title, description, goal_type, metric_type, target_value, weight, calibration, due_date, status, quarter, created_at, updated_at)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+           RETURNING *`,
+          [
+            sourceKPI.employee_id,
+            sourceKPI.cycle_id,
+            clonedKRA.id, // Link to new KRA
+            sourceKPI.kpi_template_id,
+            sourceKPI.title,
+            sourceKPI.description,
+            sourceKPI.goal_type,
+            sourceKPI.metric_type,
+            sourceKPI.target_value,
+            sourceKPI.weight,
+            calibrationJson, // Use properly formatted calibration JSON
+            sourceKPI.due_date,
+            'draft', // Reset status to draft for cloned KPI
+            target_quarter
+          ]
+        );
+
+        clonedKPIs.push(newKPI.rows[0]);
+      }
+    }
+
+    res.json({
+      data: {
+        kras: clonedKRAs,
+        kpis: clonedKPIs
+      },
+      message: `Successfully cloned ${clonedKRAs.length} KRAs and ${clonedKPIs.length} KPIs from Q${source_quarter} to Q${target_quarter}`
+    });
+  } catch (error) {
+    console.error('Error cloning goals:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/goals/:id
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
@@ -401,6 +531,55 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     }
     res.json({ message: 'Goal deleted' });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/goals/:id/revoke - Revoke (delete) approved goal/KPI
+router.post('/:id/revoke', authMiddleware, async (req, res) => {
+  try {
+    // Get goal details including employee_id, cycle_id, quarter, and status
+    const goalResult = await query(
+      'SELECT employee_id, cycle_id, quarter, status FROM goals WHERE id = $1',
+      [req.params.id]
+    );
+    
+    if (goalResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Goal not found' });
+    }
+    
+    const goal = goalResult.rows[0];
+    
+    // Only allow revoking approved goals
+    if (goal.status !== 'approved') {
+      return res.status(400).json({ error: 'Only approved goals can be revoked' });
+    }
+    
+    // Check if user is manager or delegate
+    const auth = await checkManagerOrDelegate(
+      req.user.userId,
+      goal.employee_id,
+      goal.cycle_id,
+      goal.quarter
+    );
+    
+    if (!auth.isAuthorized) {
+      return res.status(403).json({ error: 'Not authorized to revoke this goal' });
+    }
+    
+    // Delete the goal
+    const result = await query(
+      'DELETE FROM goals WHERE id = $1 RETURNING id',
+      [req.params.id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Goal not found' });
+    }
+    
+    res.json({ message: 'Approved goal revoked and deleted successfully' });
+  } catch (error) {
+    console.error('Revoke goal error:', error);
     res.status(500).json({ error: error.message });
   }
 });

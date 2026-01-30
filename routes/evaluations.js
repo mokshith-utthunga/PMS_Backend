@@ -1236,6 +1236,7 @@ router.get('/rating-rejections', authMiddleware, async (req, res) => {
 
 // POST /api/hr/normalize?quarter=QX&cycle_id=UUID
 // Normalize ratings for a quarter using Box-Cox transform
+// Optional body parameters: managerWeight, gradeWeight, minGroupSize, useWinsorization, maxChangeFromRaw
 router.post('/hr/normalize', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
   try {
     const { quarter, cycle_id } = req.query;
@@ -1250,11 +1251,29 @@ router.post('/hr/normalize', authMiddleware, requireRole(['hr_admin', 'hrbp', 's
       return res.status(400).json({ error: 'quarter must be between 1 and 4' });
     }
     
-    const result = await normalizeRatings(quarterNum, cycle_id, userId);
+    // Extract optional configuration from request body
+    const config = {};
+    if (req.body.managerWeight !== undefined) {
+      config.managerWeight = parseFloat(req.body.managerWeight);
+      config.gradeWeight = 1 - config.managerWeight; // Ensure weights sum to 1
+    }
+    if (req.body.minGroupSize !== undefined) {
+      config.minGroupSize = parseInt(req.body.minGroupSize);
+    }
+    if (req.body.useWinsorization !== undefined) {
+      config.useWinsorization = req.body.useWinsorization === true || req.body.useWinsorization === 'true';
+    }
+    if (req.body.maxChangeFromRaw !== undefined) {
+      config.maxChangeFromRaw = parseFloat(req.body.maxChangeFromRaw);
+    }
+    
+    console.log(`Starting normalization for quarter ${quarterNum}, cycle ${cycle_id}`, config);
+    const result = await normalizeRatings(quarterNum, cycle_id, userId, config);
+    console.log(`Normalization completed:`, result);
     res.json({ data: result });
   } catch (error) {
     console.error('Normalize ratings error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Failed to normalize ratings' });
   }
 });
 
