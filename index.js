@@ -19,6 +19,7 @@ import bonusKrasRoutes from './routes/bonus-kras.js';
 import permissionsRoutes from './routes/permissions.js';
 import templatesRoutes from './routes/templates.js';
 import calibrationRoutes from './routes/calibration.js';
+import delegationRoutes from './routes/delegations.js';
 
 // Load environment variables
 dotenv.config();
@@ -88,6 +89,7 @@ app.use('/api/bonus-kras', bonusKrasRoutes);
 app.use('/api/permissions', permissionsRoutes);
 app.use('/api/templates', templatesRoutes);
 app.use('/api/calibration', calibrationRoutes);
+app.use('/api/delegations', delegationRoutes);
 
 // Generic API (fallback for complex queries)
 app.use('/api', apiRoutes);

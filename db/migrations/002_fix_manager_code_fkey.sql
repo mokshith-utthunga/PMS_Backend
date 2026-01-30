@@ -1,5 +1,5 @@
--- Migration: Fix manager_code foreign key to reference emp_code instead of id
--- This migration fixes the foreign key constraint that may still reference employees(id)
+-- Migration: Remove manager_code foreign key constraint
+-- This migration removes the foreign key constraint to allow manager_code to reference any value
 
 BEGIN;
 
@@ -81,18 +81,13 @@ BEGIN
   END IF;
 END $$;
 
--- Step 4: Add the correct foreign key constraint referencing employees(emp_code)
+-- Step 4: Remove foreign key constraint (no longer needed)
 DO $$
 BEGIN
-  -- Drop if exists (should already be dropped, but just in case)
+  -- Drop if exists (foreign key constraint removed - manager_code can reference non-existent managers)
   ALTER TABLE employees DROP CONSTRAINT IF EXISTS employees_manager_code_fkey;
   
-  -- Add new constraint referencing employees(emp_code)
-  ALTER TABLE employees 
-  ADD CONSTRAINT employees_manager_code_fkey 
-  FOREIGN KEY (manager_code) REFERENCES employees(emp_code) ON DELETE SET NULL;
-  
-  RAISE NOTICE 'Created foreign key constraint employees_manager_code_fkey referencing employees(emp_code)';
+  RAISE NOTICE 'Removed foreign key constraint on manager_code - manager_code can now reference any value';
 END $$;
 
 COMMIT;

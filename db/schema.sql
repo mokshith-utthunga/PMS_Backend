@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS employees (
     profile_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
     full_name TEXT NOT NULL,
     email TEXT UNIQUE NOT NULL,
-    manager_code VARCHAR(255) REFERENCES employees(emp_code) ON DELETE SET NULL,
+    manager_code VARCHAR(255),
     department TEXT NOT NULL,
     business_unit TEXT NOT NULL,
     grade TEXT NOT NULL,

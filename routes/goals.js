@@ -1,6 +1,7 @@
 import express from 'express';
 import { query } from '../config/database.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { checkManagerOrDelegate } from './delegations.js';
 
 const router = express.Router();
 
@@ -78,7 +79,7 @@ router.get('/my', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/goals/pending-approvals - For managers
+// GET /api/goals/pending-approvals - For managers (includes delegated)
 router.get('/pending-approvals', authMiddleware, async (req, res) => {
   try {
     const { cycle_id, quarter } = req.query;
@@ -93,16 +94,28 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
       return res.json({ data: [], count: 0 });
     }
     
+    const managerId = empResult.rows[0].id;
     const managerCode = empResult.rows[0].emp_code;
     
     let sql = `
-      SELECT g.*, e.full_name, e.email 
+      SELECT DISTINCT g.*, e.full_name, e.email
       FROM goals g
       JOIN employees e ON g.employee_id = e.id
-      WHERE e.manager_code = $1 AND g.status = 'submitted'
+      WHERE g.status = 'submitted'
+        AND (
+          e.manager_code = $1
+          OR EXISTS (
+            SELECT 1 FROM delegations d
+            WHERE d.delegate_id = $2
+              AND d.reportee_id = e.id
+              AND d.cycle_id = g.cycle_id
+              AND d.quarter = g.quarter
+              AND d.revoked_at IS NULL
+          )
+        )
     `;
-    const params = [managerCode];
-    let idx = 2;
+    const params = [managerCode, managerId];
+    let idx = 3;
     
     if (cycle_id) {
       sql += ` AND g.cycle_id = $${idx++}`;
@@ -114,7 +127,8 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
     }
     
     const result = await query(sql, params);
-    res.json({ data: result.rows, count: result.rows.length });
+    const uniqueEmployees = new Set(result.rows.map(row => row.employee_id));
+    res.json({ data: result.rows, count: uniqueEmployees.size});
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -302,13 +316,34 @@ router.post('/:id/submit', authMiddleware, async (req, res) => {
 // POST /api/goals/:id/approve
 router.post('/:id/approve', authMiddleware, async (req, res) => {
   try {
+    // Get goal details
+    const goalResult = await query(
+      'SELECT employee_id, cycle_id, quarter FROM goals WHERE id = $1',
+      [req.params.id]
+    );
+    
+    if (goalResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Goal not found' });
+    }
+    
+    const goal = goalResult.rows[0];
+    
+    // Check if user is manager or delegate
+    const auth = await checkManagerOrDelegate(
+      req.user.userId,
+      goal.employee_id,
+      goal.cycle_id,
+      goal.quarter
+    );
+    
+    if (!auth.isAuthorized) {
+      return res.status(403).json({ error: 'Not authorized to approve this goal' });
+    }
+    
     const result = await query(
       `UPDATE goals SET status = 'approved', updated_at = NOW() WHERE id = $1 RETURNING *`,
       [req.params.id]
     );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Goal not found' });
-    }
     res.json({ data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -319,13 +354,35 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
 router.post('/:id/return', authMiddleware, async (req, res) => {
   try {
     const { comments } = req.body;
-    const result = await query(
-      `UPDATE goals SET status = 'returned', updated_at = NOW() WHERE id = $1 RETURNING *`,
+    
+    // Get goal details
+    const goalResult = await query(
+      'SELECT employee_id, cycle_id, quarter FROM goals WHERE id = $1',
       [req.params.id]
     );
-    if (result.rows.length === 0) {
+    
+    if (goalResult.rows.length === 0) {
       return res.status(404).json({ error: 'Goal not found' });
     }
+    
+    const goal = goalResult.rows[0];
+    
+    // Check if user is manager or delegate
+    const auth = await checkManagerOrDelegate(
+      req.user.userId,
+      goal.employee_id,
+      goal.cycle_id,
+      goal.quarter
+    );
+    
+    if (!auth.isAuthorized) {
+      return res.status(403).json({ error: 'Not authorized to return this goal' });
+    }
+    
+    const result = await query(
+      `UPDATE goals SET status = 'returned', manager_comments = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [comments || null, req.params.id]
+    );
     res.json({ data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });

@@ -1,6 +1,7 @@
 import express from 'express';
 import { query } from '../config/database.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { checkManagerOrDelegate } from './delegations.js';
 
 const router = express.Router();
 
@@ -11,7 +12,15 @@ router.get('/goal-self-ratings', authMiddleware, async (req, res) => {
   try {
     const { quarterly_review_id, goal_id } = req.query;
     
-    let sql = 'SELECT * FROM goal_self_ratings WHERE 1=1';
+    
+    let sql = `
+    SELECT 
+      g.metric_type,
+      s.*
+    FROM goal_self_ratings s
+    JOIN goals g ON g.id = s.goal_id
+    WHERE 1=1
+  `;
     const params = [];
     let idx = 1;
 
@@ -364,6 +373,20 @@ router.get('/quarterly-manager-reviews/count', authMiddleware, async (req, res) 
 router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
   try {
     const { employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, status, calculated_overall_rating } = req.body;
+    
+    // Check if user is manager or delegate
+    if (employee_id && cycle_id && quarter) {
+      const auth = await checkManagerOrDelegate(
+        req.user.userId,
+        employee_id,
+        cycle_id,
+        parseInt(quarter)
+      );
+      
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ error: 'Not authorized to submit review for this employee' });
+      }
+    }
     
     // Upsert quarterly manager review
     const result = await query(
@@ -840,6 +863,120 @@ router.post('/employee-accept-rating', authMiddleware, async (req, res) => {
     res.json({ data: result.rows[0] });
   } catch (error) {
     console.error('Employee accept rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== YEAR-END EVALUATION ==========
+
+// GET /api/evaluations/year-end-evaluation
+// Get year-end evaluation for an employee in a cycle
+router.get('/year-end-evaluation', authMiddleware, async (req, res) => {
+  try {
+    const { employee_id, cycle_id } = req.query;
+    
+    if (!employee_id || !cycle_id) {
+      return res.status(400).json({ error: 'employee_id and cycle_id are required' });
+    }
+    
+    const result = await query(
+      `SELECT * FROM manager_evaluations 
+       WHERE employee_id = $1 AND cycle_id = $2`,
+      [employee_id, cycle_id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ data: null });
+    }
+    
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Get year-end evaluation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/year-end-evaluation
+// Create or update year-end evaluation for an employee
+router.post('/year-end-evaluation', authMiddleware, async (req, res) => {
+  try {
+    const { 
+      employee_id, 
+      cycle_id, 
+      evaluator_id,
+      overall_rating,
+      overall_comments,
+      potential_rating,
+      development_recommendations,
+      status 
+    } = req.body;
+    
+    if (!employee_id || !cycle_id || !evaluator_id) {
+      return res.status(400).json({ error: 'employee_id, cycle_id, and evaluator_id are required' });
+    }
+    
+    // Check if record exists
+    const existing = await query(
+      `SELECT id FROM manager_evaluations WHERE employee_id = $1 AND cycle_id = $2`,
+      [employee_id, cycle_id]
+    );
+    
+    let result;
+    if (existing.rows.length > 0) {
+      // Update existing record
+      result = await query(
+        `UPDATE manager_evaluations SET
+          evaluator_id = $1,
+          overall_rating = $2,
+          overall_comments = $3,
+          potential_rating = $4,
+          development_recommendations = $5,
+          status = $6,
+          submitted_at = CASE WHEN $6 = 'submitted' THEN NOW() ELSE submitted_at END,
+          updated_at = NOW()
+         WHERE employee_id = $7 AND cycle_id = $8
+         RETURNING *`,
+        [
+          evaluator_id,
+          overall_rating ?? null,
+          overall_comments ?? null,
+          potential_rating ?? null,
+          development_recommendations ?? null,
+          status || 'pending',
+          employee_id,
+          cycle_id
+        ]
+      );
+    } else {
+      // Create new record
+      result = await query(
+        `INSERT INTO manager_evaluations (
+          id, employee_id, cycle_id, evaluator_id,
+          overall_rating, overall_comments, potential_rating, development_recommendations,
+          status, submitted_at, created_at, updated_at
+        )
+        VALUES (
+          gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8,
+          CASE WHEN $8 = 'submitted' THEN NOW() ELSE NULL END,
+          NOW(), NOW()
+        )
+        RETURNING *`,
+        [
+          employee_id,
+          cycle_id,
+          evaluator_id,
+          overall_rating ?? null,
+          overall_comments ?? null,
+          potential_rating ?? null,
+          development_recommendations ?? null,
+          status || 'pending'
+        ]
+      );
+    }
+    
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Upsert year-end evaluation error:', error);
     res.status(500).json({ error: error.message });
   }
 });

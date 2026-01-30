@@ -18,9 +18,9 @@ router.post('/departments', authMiddleware, async (req, res) => {
   try {
     const { name, code, description } = req.body;
     const result = await query(
-      `INSERT INTO departments (id, name, code, description, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW()) RETURNING *`,
-      [name, code, description]
+      `INSERT INTO departments (id, name, created_at)
+       VALUES (gen_random_uuid(), $1, NOW()) RETURNING *`,
+      [name]
     );
     res.status(201).json({ data: result.rows[0] });
   } catch (error) {
@@ -66,9 +66,9 @@ router.post('/grades', authMiddleware, async (req, res) => {
   try {
     const { name, code, level, description } = req.body;
     const result = await query(
-      `INSERT INTO grades (id, name, code, level, description, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW(), NOW()) RETURNING *`,
-      [name, code, level, description]
+      `INSERT INTO grades (id, name,level, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, NOW(), NOW()) RETURNING *`,
+      [name, level]
     );
     res.status(201).json({ data: result.rows[0] });
   } catch (error) {
@@ -80,10 +80,10 @@ router.put('/grades/:id', authMiddleware, async (req, res) => {
   try {
     const { name, code, level, description, is_active } = req.body;
     const result = await query(
-      `UPDATE grades SET name = COALESCE($1, name), code = COALESCE($2, code), 
-       level = COALESCE($3, level), description = $4, is_active = COALESCE($5, is_active), updated_at = NOW()
-       WHERE id = $6 RETURNING *`,
-      [name ?? null, code ?? null, level ?? null, description ?? null, is_active ?? null, req.params.id]
+      `UPDATE grades SET name = COALESCE($1, name), 
+       level = COALESCE($2, level),  updated_at = NOW()
+       WHERE id = $3 RETURNING *`,
+      [name ?? null, level ?? null, req.params.id]
     );
     res.json({ data: result.rows[0] });
   } catch (error) {

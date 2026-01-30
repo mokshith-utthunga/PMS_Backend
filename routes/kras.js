@@ -78,6 +78,7 @@ router.post('/', authMiddleware, async (req, res) => {
   try {
     const { employee_id, cycle_id, title, description, weight, status, quarter, kra_template_id } = req.body;
     
+    
     const result = await query(
       `INSERT INTO kras (id, employee_id, cycle_id, kra_template_id, title, description, weight, status, quarter, created_at, updated_at)
        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
@@ -553,7 +554,6 @@ router.put('/kpi-templates/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// DELETE /api/kras/kpi-templates/:id - Delete a specific KPI template
 router.delete('/kpi-templates/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;

@@ -10,13 +10,29 @@ ALTER TABLE public.goals_quarterly_cycles
     DROP CONSTRAINT IF EXISTS goals_quarterly_cycles_date_range_validation;
 
 -- =====================================================
--- STEP 2: Check for existing invalid data
+-- STEP 2: Check if columns exist, then validate and add constraint
 -- =====================================================
 
 DO $$
 DECLARE
     invalid_rows INTEGER;
+    columns_exist BOOLEAN;
 BEGIN
+    -- Check if quarterly_start_date and quarterly_end_date columns exist
+    -- (They are removed by migration 013, so this migration may run after 013)
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_schema = 'public'
+        AND table_name = 'goals_quarterly_cycles'
+        AND column_name = 'quarterly_start_date'
+    ) INTO columns_exist;
+    
+    IF NOT columns_exist THEN
+        RAISE NOTICE 'Columns quarterly_start_date and quarterly_end_date do not exist in goals_quarterly_cycles.';
+        RAISE NOTICE 'This migration is being skipped. Migration 013 removes these columns and handles date validation differently.';
+        RETURN;
+    END IF;
+    
     -- Check for rows where goal or manager review dates are outside quarterly date range
     SELECT COUNT(*) INTO invalid_rows
     FROM public.goals_quarterly_cycles
