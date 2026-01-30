@@ -107,7 +107,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 // GET /api/employees/:id/team - Get direct reports
 router.get('/:id/team', authMiddleware, async (req, res) => {
   try {
-    // First, get the employee's emp_code (manager_code now references emp_code, not id)
+    // First, get the employee's emp_code (manager_code stores emp_code value)
     const empResult = await query(
       'SELECT emp_code FROM employees WHERE id = $1',
       [req.params.id]

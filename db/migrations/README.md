@@ -118,7 +118,7 @@ The migration maintains backward compatibility:
 1. **Role Migration:** If a user had multiple roles in `user_roles`, the migration selects the highest priority role:
    - Priority: system_admin > hrbp > hr_admin > dept_head > manager > employee
 
-2. **Foreign Keys:** The `manager_code` column still references `employees.id` (UUID), not `emp_code`. This maintains referential integrity.
+2. **Manager Code:** The `manager_code` column stores `emp_code` values (VARCHAR). No foreign key constraint is enforced, allowing manager codes to be set even if the manager doesn't exist in the employees table yet.
 
 3. **Indexes:** Old indexes are dropped and new ones created automatically by the migration.
 

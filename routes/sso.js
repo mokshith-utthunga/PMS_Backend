@@ -2,6 +2,7 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../config/database.js';
 import { generateToken, setAuthCookies, clearAuthCookies } from '../middleware/auth.js';
+import { syncEmployeeDataFromUserMaster } from '../services/userMasterApi.js';
 
 const router = express.Router();
 
@@ -181,6 +182,17 @@ router.get('/', async (req, res) => {
       //   }
       // }
 
+      // Sync employee data from User Master API after successful authentication
+      // Use email for SSO login as per requirements
+      try {
+        console.log(`[SSO] Attempting to sync employee data for profileId: ${profileId}, email: ${email}, employeeCode: ${employeeCode}`);
+        const syncResult = await syncEmployeeDataFromUserMaster(profileId, email, employeeCode);
+        console.log(`[SSO] Sync result: ${syncResult}`);
+      } catch (syncError) {
+        // Log error but don't fail login if sync fails
+        console.error('[SSO] Error syncing employee data from User Master:', syncError);
+        console.error('[SSO] Error stack:', syncError.stack);
+      }
 
       const token = generateToken(user.id, user.email);
       setAuthCookies(res, token, user);
@@ -362,6 +374,17 @@ router.post('/callback', async (req, res) => {
       }
     }
 
+    // Sync employee data from User Master API after successful authentication
+    // Use email for SSO login as per requirements
+    try {
+      console.log(`[SSO] Attempting to sync employee data for profileId: ${profileId}, email: ${email}, employeeCode: ${employeeCode}`);
+      const syncResult = await syncEmployeeDataFromUserMaster(profileId, email, employeeCode);
+      console.log(`[SSO] Sync result: ${syncResult}`);
+    } catch (syncError) {
+      // Log error but don't fail login if sync fails
+      console.error('[SSO] Error syncing employee data from User Master:', syncError);
+      console.error('[SSO] Error stack:', syncError.stack);
+    }
 
     // Generate token and set cookies
     const token = generateToken(user.id, user.email);
@@ -529,6 +552,17 @@ router.get('/callback', async (req, res) => {
       }
     }
 
+    // Sync employee data from User Master API after successful authentication
+    // Use email for SSO login as per requirements
+    try {
+      console.log(`[SSO] Attempting to sync employee data for profileId: ${profileId}, email: ${email}, employeeCode: ${employeeCode}`);
+      const syncResult = await syncEmployeeDataFromUserMaster(profileId, email, employeeCode);
+      console.log(`[SSO] Sync result: ${syncResult}`);
+    } catch (syncError) {
+      // Log error but don't fail login if sync fails
+      console.error('[SSO] Error syncing employee data from User Master:', syncError);
+      console.error('[SSO] Error stack:', syncError.stack);
+    }
 
     // Generate token and set cookies
     const token = generateToken(user.id, user.email);

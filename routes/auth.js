@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../config/database.js';
 import { generateToken, authMiddleware, optionalAuthMiddleware, setAuthCookies, clearAuthCookies } from '../middleware/auth.js';
+import { syncEmployeeDataFromUserMaster } from '../services/userMasterApi.js';
 
 const router = express.Router();
 
@@ -81,12 +82,30 @@ router.post('/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    console.log('user',password, result.rows);
-
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    try {
+      // Try to get employee_code from employees table
+      const empResult = await query(
+        'SELECT emp_code FROM employees WHERE profile_id = $1 OR email = $2 LIMIT 1',
+        [user.id, user.email]
+      );
+      
+      const employeeCode = empResult.rows.length > 0 ? empResult.rows[0].emp_code : null;
+      
+      console.log(`[Auth] Attempting to sync employee data for profileId: ${user.id}, email: ${user.email}, employeeCode: ${employeeCode || 'not found'}`);
+      
+      // Sync using employee_code if available, otherwise use email
+      const syncResult = await syncEmployeeDataFromUserMaster(user.id, user.email, employeeCode);
+      console.log(`[Auth] Sync result: ${syncResult}`);
+    } catch (syncError) {
+      // Log error but don't fail login if sync fails
+      console.error('[Auth] Error syncing employee data from User Master:', syncError);
+      console.error('[Auth] Error stack:', syncError.stack);
     }
 
     // Generate token and set cookies
@@ -155,6 +174,46 @@ router.get('/roles', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Roles error:', error);
     res.status(500).json({ error: 'Failed to get roles' });
+  }
+});
+
+// Reset password - POST /api/auth/reset-password (for admin/debugging)
+// This endpoint allows resetting a user's password - useful for testing
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+
+    if (!email || !newPassword) {
+      return res.status(400).json({ error: 'Email and new password are required' });
+    }
+
+    // Find user (case-insensitive)
+    const result = await query(
+      'SELECT id, email FROM profiles WHERE LOWER(email) = LOWER($1)',
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = result.rows[0];
+
+    // Hash new password
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(newPassword, salt);
+
+    // Update password
+    await query(
+      'UPDATE profiles SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      [passwordHash, user.id]
+    );
+
+    console.log(`[Auth] Password reset for user: ${email}`);
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ error: 'Failed to reset password' });
   }
 });
 

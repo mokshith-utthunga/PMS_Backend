@@ -84,7 +84,7 @@ router.get('/active', authMiddleware, async (req, res) => {
       });
     }
 
-    // Get direct reports (manager_code now references emp_code)
+    // Get direct reports (manager_code stores emp_code value)
     const directReportsResult = await query(
       "SELECT id FROM employees WHERE manager_code = $1 AND status = 'active'",
       [managerCode]
@@ -92,13 +92,27 @@ router.get('/active', authMiddleware, async (req, res) => {
     const directReportIds = directReportsResult.rows.map(r => r.id);
     const directReportsCount = directReportIds.length;
 
-    if (directReportsCount === 0) {
+    // Get delegated employees (employees delegated TO current user)
+    const delegatedEmployeesResult = await query(
+      `SELECT DISTINCT reportee_id 
+       FROM delegations 
+       WHERE delegate_id = $1 AND cycle_id = $2 AND revoked_at IS NULL`,
+      [managerId, cycle.id]
+    );
+    const delegatedEmployeeIds = delegatedEmployeesResult.rows.map(r => r.reportee_id);
+    const delegatedCount = delegatedEmployeeIds.length;
+
+    // Combine direct reports and delegated employees for queries
+    const allEmployeeIds = [...new Set([...directReportIds, ...delegatedEmployeeIds])];
+
+    if (allEmployeeIds.length === 0) {
       return res.json({
         data: cycle,
         quarterly_cycles: quarterlyCyclesResult.rows,
         goals_quarterly_cycles: goalsQuarterlyCyclesResult.rows,
         dashboard: {
           direct_reports_count: 0,
+          delegated_count: 0,
           goals_pending_approval: 0,
           evaluations_pending: 0,
           quarterly_pending: 0,
@@ -108,15 +122,15 @@ router.get('/active', authMiddleware, async (req, res) => {
       });
     }
 
-    // Build IN clause placeholders for direct report IDs
-    const idPlaceholders = directReportIds.map((_, i) => `$${i + 1}`).join(', ');
-    const cycleIdIndex = directReportIds.length + 1;
+    // Build IN clause placeholders for all employee IDs (direct reports + delegated)
+    const idPlaceholders = allEmployeeIds.map((_, i) => `$${i + 1}`).join(', ');
+    const cycleIdIndex = allEmployeeIds.length + 1;
 
     // Get goals pending approval (status = 'submitted')
     const goalsPendingResult = await query(
-      `SELECT COUNT(*) as count FROM goals 
+      `SELECT count(distinct(employee_id)) as count FROM goals 
        WHERE employee_id IN (${idPlaceholders}) AND cycle_id = $${cycleIdIndex} AND status = 'submitted'`,
-      [...directReportIds, cycle.id]
+      [...allEmployeeIds, cycle.id]
     );
     const goalsPendingApproval = parseInt(goalsPendingResult.rows[0]?.count || 0);
 
@@ -125,7 +139,7 @@ router.get('/active', authMiddleware, async (req, res) => {
       `SELECT qsr.employee_id, qsr.quarter, qsr.status as self_status
        FROM quarterly_self_reviews qsr
        WHERE qsr.employee_id IN (${idPlaceholders}) AND qsr.cycle_id = $${cycleIdIndex} AND qsr.status = 'submitted'`,
-      [...directReportIds, cycle.id]
+      [...allEmployeeIds, cycle.id]
     );
 
     // Get quarterly manager reviews to check what's been reviewed
@@ -133,7 +147,7 @@ router.get('/active', authMiddleware, async (req, res) => {
       `SELECT employee_id, quarter, status
        FROM quarterly_manager_reviews
        WHERE employee_id IN (${idPlaceholders}) AND cycle_id = $${cycleIdIndex}`,
-      [...directReportIds, cycle.id]
+      [...allEmployeeIds, cycle.id]
     );
 
     // Create a map of quarterly manager reviews by employee and quarter
@@ -148,7 +162,7 @@ router.get('/active', authMiddleware, async (req, res) => {
       `SELECT employee_id, status
        FROM manager_evaluations
        WHERE employee_id IN (${idPlaceholders}) AND cycle_id = $${cycleIdIndex}`,
-      [...directReportIds, cycle.id]
+      [...allEmployeeIds, cycle.id]
     );
 
     // Create a map of manager evaluations by employee (for year-end)
@@ -193,7 +207,7 @@ router.get('/active', authMiddleware, async (req, res) => {
       `SELECT se.employee_id, se.status as self_status
        FROM self_evaluations se
        WHERE se.employee_id IN (${idPlaceholders}) AND se.cycle_id = $${cycleIdIndex} AND se.quarter IS NULL AND se.status = 'submitted'`,
-      [...directReportIds, cycle.id]
+      [...allEmployeeIds, cycle.id]
     );
 
     let yearEndPending = 0;
@@ -227,6 +241,7 @@ router.get('/active', authMiddleware, async (req, res) => {
       goals_quarterly_cycles: goalsQuarterlyCyclesResult.rows,
       dashboard: {
         direct_reports_count: directReportsCount,
+        delegated_count: delegatedCount,
         goals_pending_approval: goalsPendingApproval,
         evaluations_pending: employeesWithPending.size,
         quarterly_pending: quarterlyPending,

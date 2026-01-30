@@ -154,13 +154,9 @@ BEGIN
   ALTER TABLE employees 
   ALTER COLUMN manager_code TYPE VARCHAR(255);
   
-  -- Add new foreign key constraint referencing employees(emp_code)
-  -- Drop first to ensure clean state
+  -- Note: Foreign key constraint removed - manager_code no longer has referential integrity constraint
+  -- This allows manager_code to be set even if the manager doesn't exist in employees table yet
   ALTER TABLE employees DROP CONSTRAINT IF EXISTS employees_manager_code_fkey;
-  
-  ALTER TABLE employees 
-  ADD CONSTRAINT employees_manager_code_fkey 
-  FOREIGN KEY (manager_code) REFERENCES employees(emp_code) ON DELETE SET NULL;
 END $$;
 
 -- Step 5: Update index name for manager_code
