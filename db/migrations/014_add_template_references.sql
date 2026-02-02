@@ -20,7 +20,11 @@ CREATE INDEX IF NOT EXISTS idx_kras_kra_template_id ON kras(kra_template_id) WHE
 CREATE INDEX IF NOT EXISTS idx_goals_kpi_template_id ON goals(kpi_template_id) WHERE kpi_template_id IS NOT NULL;
 
 -- Step 5: Create a view for easy querying of goals with template info
-CREATE OR REPLACE VIEW goals_with_templates AS
+-- Drop view if it exists to avoid column rename conflicts
+-- Use CASCADE to drop dependent objects if any
+DROP VIEW IF EXISTS goals_with_templates CASCADE;
+
+CREATE VIEW goals_with_templates AS
 SELECT 
   g.*,
   kt.title as kpi_template_title,

@@ -8,7 +8,7 @@ const router = express.Router();
 // GET /api/goals - Get goals with filters
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, status, type, quarter } = req.query;
+    const { employee_id, cycle_id, status, type, quarter, period_type, transition_id } = req.query;
     
     let sql = 'SELECT * FROM goals WHERE 1=1';
     const params = [];
@@ -33,6 +33,18 @@ router.get('/', authMiddleware, async (req, res) => {
     if (quarter) {
       sql += ` AND quarter = $${idx++}`;
       params.push(parseInt(quarter));
+    }
+    if (period_type) {
+      sql += ` AND period_type = $${idx++}::period_type`;
+      params.push(period_type);
+    }
+    if (transition_id) {
+      sql += ` AND transition_id = $${idx++}`;
+      params.push(transition_id);
+    } else if (period_type && period_type !== 'full_quarter') {
+      // If period_type is specified but not full_quarter, ensure we filter by transition_id
+      // This prevents mixing full_quarter goals with transition goals
+      sql += ` AND transition_id IS NOT NULL`;
     }
 
     sql += ' ORDER BY created_at DESC';
@@ -283,7 +295,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 // POST /api/goals
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, kra_id, kpi_template_id, goal_type, title, description, weight, target_value, metric_type, due_date, status, calibration, quarter } = req.body;
+    const { employee_id, cycle_id, kra_id, kpi_template_id, goal_type, title, description, weight, target_value, metric_type, due_date, status, calibration, quarter, period_type, transition_id } = req.body;
     
     // Validate and format calibration if provided
     let calibrationJson = null;
@@ -296,10 +308,61 @@ router.post('/', authMiddleware, async (req, res) => {
         calibrationJson = calibration;
       }
     }
+
+    // Auto-detect transition if not explicitly provided
+    let periodType = period_type || null;
+    let transitionId = transition_id || null;
+    let periodStartDate = null;
+    let periodEndDate = null;
+
+    if (employee_id && cycle_id && quarter && !periodType && !transitionId) {
+      // Check if there's an active transition for this employee/cycle/quarter
+      const transitionResult = await query(
+        `SELECT id, transition_date
+         FROM employee_quarter_transitions 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+        [employee_id, cycle_id, quarter]
+      );
+
+      if (transitionResult.rows.length > 0) {
+        const transition = transitionResult.rows[0];
+        transitionId = transition.id;
+        const transitionDate = new Date(transition.transition_date);
+        const now = new Date();
+        transitionDate.setHours(0, 0, 0, 0);
+        
+        // Get quarter date range
+        const quarterRange = await query(
+          `SELECT quarterly_start_date, quarterly_end_date 
+           FROM goals_quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarter]
+        );
+        
+        if (quarterRange.rows.length > 0) {
+          const quarterStart = new Date(quarterRange.rows[0].quarterly_start_date);
+          const quarterEnd = new Date(quarterRange.rows[0].quarterly_end_date);
+          
+          if (now >= transitionDate) {
+            // Goal is being created after transition, mark as post_transition
+            periodType = 'post_transition';
+            periodStartDate = transitionDate.toISOString().split('T')[0];
+            periodEndDate = quarterEnd.toISOString().split('T')[0];
+          } else {
+            // Goal is being created before transition, mark as pre_transition
+            periodType = 'pre_transition';
+            periodStartDate = quarterStart.toISOString().split('T')[0];
+            const preEndDate = new Date(transitionDate);
+            preEndDate.setDate(preEndDate.getDate() - 1);
+            periodEndDate = preEndDate.toISOString().split('T')[0];
+          }
+        }
+      }
+    }
     
     const result = await query(
-      `INSERT INTO goals (id, employee_id, cycle_id, kra_id, kpi_template_id, title, description, goal_type, metric_type, target_value, weight, calibration, due_date, status, quarter, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+      `INSERT INTO goals (id, employee_id, cycle_id, kra_id, kpi_template_id, title, description, goal_type, metric_type, target_value, weight, calibration, due_date, status, quarter, period_type, transition_id, period_start_date, period_end_date, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::period_type, $16, $17, $18, NOW(), NOW())
        RETURNING *`,
       [
         employee_id ?? null,
@@ -315,7 +378,11 @@ router.post('/', authMiddleware, async (req, res) => {
         calibrationJson,
         due_date ?? null,
         status || 'draft',
-        quarter ?? null
+        quarter ?? null,
+        periodType,
+        transitionId,
+        periodStartDate,
+        periodEndDate
       ]
     );
     res.status(201).json({ data: result.rows[0] });

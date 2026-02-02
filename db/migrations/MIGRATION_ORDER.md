@@ -39,8 +39,14 @@
    - **WARNING**: Only run if you don't use annual cycles
    - **Status**: Run only after confirming no annual cycles
 
-### Phase 6: Remove Legacy Quarterly Columns (Future)
-6. **010_remove_legacy_quarterly_columns.sql** ⚠️
+### Phase 6: Backfill HR Approval Data
+6. **024_backfill_hr_approval_timestamps.sql** ✅
+   - Backfills `hr_approved_at`, `hr_approved_by`, and `released_at` in `quarterly_manager_reviews`
+   - For all existing PUBLISHED `normalized_ratings` records
+   - **Status**: Safe to run anytime after 002 and 023
+
+### Phase 7: Remove Legacy Quarterly Columns (Future)
+7. **010_remove_legacy_quarterly_columns.sql** ⚠️
    - Removes q1-q4 columns
    - **WARNING**: Only run after ALL code is migrated
    - **Status**: Do NOT run until code migration complete

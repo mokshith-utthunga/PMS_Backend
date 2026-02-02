@@ -1,28 +1,34 @@
 import { query } from '../config/database.js';
 
 /**
- * Normalization Configuration
- * These can be moved to a config table or environment variables
+ * GOAL-LEVEL NORMALIZATION SERVICE
+ * 
+ * This service normalizes ratings ONLY at the Goal/Overall level.
+ * KPI and KRA ratings remain unchanged (raw) for auditability.
+ * 
+ * Process:
+ * 1. Fetch Goal Raw Ratings (calculated_overall_rating from quarterly_manager_reviews)
+ * 2. Group employees by manager and by grade
+ * 3. Normalize goal ratings within each group using Box-Cox (lambda=0.5) + Min-Max
+ * 4. Combine manager and grade normalized ratings (50/50)
+ * 5. Store raw KPI/KRA ratings for audit (not normalized)
  */
+
 const DEFAULT_CONFIG = {
-  minGroupSize: 3,              // Minimum group size for full normalization
+  minGroupSize: 3,              // Minimum group size for normalization (skip if < 3)
   managerWeight: 0.5,           // Weight for manager-level normalization
   gradeWeight: 0.5,             // Weight for grade-level normalization
-  useWinsorization: true,       // Apply percentile clipping to reduce outlier impact
-  winsorizationPercentileLow: 5.0,   // P5
-  winsorizationPercentileHigh: 95.0, // P95
-  maxChangeFromRaw: 2.0,        // Maximum allowed change from raw rating (safeguard)
+  lambda: 0.5,                  // Fixed Box-Cox lambda (business-safe, deterministic)
   roundToDecimals: 2            // Round only at final display
 };
 
 /**
- * Box-Cox Transform Implementation
- * Transforms data to approximate normality
+ * Box-Cox Transform with fixed lambda = 0.5
  * @param {number} value - Input value (must be > 0)
- * @param {number} lambda - Transformation parameter
+ * @param {number} lambda - Transformation parameter (default: 0.5)
  * @returns {number} Transformed value
  */
-function boxCoxTransform(value, lambda) {
+function boxCoxTransform(value, lambda = 0.5) {
   if (value <= 0) {
     throw new Error('Box-Cox transform requires positive values');
   }
@@ -37,92 +43,18 @@ function boxCoxTransform(value, lambda) {
 }
 
 /**
- * Find optimal lambda using maximum likelihood estimation
- * Simplified approach: test range of lambda values and pick one that minimizes variance
- * @param {number[]} values - Array of positive values
- * @returns {number} Optimal lambda value
- */
-function findOptimalLambda(values) {
-  if (values.length < 2) {
-    return 0; // Default to log transform for single value
-  }
-  
-  // Check if all values are the same
-  const uniqueValues = new Set(values);
-  if (uniqueValues.size === 1) {
-    return 0; // All same, use log transform
-  }
-  
-  // Test lambda values from -2 to 2 in steps of 0.5
-  const lambdaCandidates = [];
-  for (let lambda = -2; lambda <= 2; lambda += 0.5) {
-    try {
-      const transformed = values.map(v => boxCoxTransform(v, lambda));
-      const mean = transformed.reduce((a, b) => a + b, 0) / transformed.length;
-      const variance = transformed.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / transformed.length;
-      lambdaCandidates.push({ lambda, variance });
-    } catch (e) {
-      // Skip invalid lambda
-      continue;
-    }
-  }
-  
-  // Find lambda with minimum variance (most normal distribution)
-  if (lambdaCandidates.length === 0) {
-    return 0; // Fallback to log transform
-  }
-  
-  const optimal = lambdaCandidates.reduce((min, candidate) => 
-    candidate.variance < min.variance ? candidate : min
-  );
-  
-  return optimal.lambda;
-}
-
-/**
  * Ensure all values are positive by shifting if needed
  * @param {number[]} values - Array of values
- * @returns {{values: number[], shift: number}} Shifted values and shift amount
+ * @returns {number[]} Positive values
  */
 function ensurePositive(values) {
   const minValue = Math.min(...values);
   if (minValue > 0) {
-    return { values, shift: 0 };
+    return values;
   }
-  
   // Shift all values to be positive (add constant)
   const shift = Math.abs(minValue) + 1;
-  return {
-    values: values.map(v => v + shift),
-    shift
-  };
-}
-
-/**
- * Winsorization: Clip extreme values to percentiles
- * Prevents one extreme outlier from distorting the whole group
- * @param {number[]} values - Array of values
- * @param {number} percentileLow - Lower percentile (e.g., 5)
- * @param {number} percentileHigh - Upper percentile (e.g., 95)
- * @returns {number[]} Winsorized values
- */
-function winsorize(values, percentileLow = 5.0, percentileHigh = 95.0) {
-  if (values.length < 3) {
-    return values; // Not enough data for winsorization
-  }
-  
-  const sorted = [...values].sort((a, b) => a - b);
-  const lowIndex = Math.floor((percentileLow / 100) * sorted.length);
-  const highIndex = Math.ceil((percentileHigh / 100) * sorted.length) - 1;
-  
-  const p5 = sorted[lowIndex];
-  const p95 = sorted[highIndex];
-  
-  return values.map(v => {
-    if (v < p5) return p5;
-    if (v > p95) return p95;
-    return v;
-  });
+  return values.map(v => v + shift);
 }
 
 /**
@@ -140,43 +72,62 @@ function minMaxScale(value, min, max) {
 }
 
 /**
- * Global scaling fallback for tiny groups
- * Scales raw rating to [1, 5] using global min/max of the quarter
- * @param {number} rawRating - Raw rating value
- * @param {number} globalMin - Minimum rating in the quarter
- * @param {number} globalMax - Maximum rating in the quarter
- * @returns {number} Scaled value in [1, 5]
+ * Normalize goal ratings for a group
+ * @param {number[]} rawRatings - Array of raw goal ratings
+ * @param {number} lambda - Box-Cox lambda (default: 0.5)
+ * @returns {number[]} Normalized ratings in [1, 5]
  */
-function globalScale(rawRating, globalMin, globalMax) {
-  if (globalMax === globalMin) {
-    return 3; // Default to middle if all same
-  }
-  return 1 + (rawRating - globalMin) * (5 - 1) / (globalMax - globalMin);
-}
-
-/**
- * Apply "no-shock" safeguard: cap change from raw rating
- * @param {number} normalizedRating - Normalized rating
- * @param {number} rawRating - Original raw rating
- * @param {number} maxChange - Maximum allowed change
- * @returns {number} Clamped rating
- */
-function applyNoShockSafeguard(normalizedRating, rawRating, maxChange = 2.0) {
-  const change = Math.abs(normalizedRating - rawRating);
-  if (change <= maxChange) {
-    return normalizedRating;
+function normalizeGroup(rawRatings, lambda = 0.5) {
+  if (rawRatings.length === 0) {
+    return [];
   }
   
-  // Clamp to within maxChange
-  if (normalizedRating > rawRating) {
-    return rawRating + maxChange;
-  } else {
-    return rawRating - maxChange;
-  }
+  // Ensure positive values
+  const positiveRatings = ensurePositive(rawRatings);
+  
+  // Box-Cox transform
+  const transformed = positiveRatings.map(v => boxCoxTransform(v, lambda));
+  
+  // Min-Max scale to [1, 5]
+  const min = Math.min(...transformed);
+  const max = Math.max(...transformed);
+  const scaled = transformed.map(v => minMaxScale(v, min, max));
+  
+  return scaled;
 }
 
 /**
- * Normalize ratings for a given quarter and cycle
+ * Calculate KRA rating from KPI ratings (weighted average)
+ * @param {string} kraId - KRA ID
+ * @param {Array} kpis - Array of KPIs with kra_id and weight
+ * @param {Object} kpiRatings - Map of goal_id -> rating
+ * @returns {number|null} KRA rating or null if no ratings
+ */
+function calculateKRARating(kraId, kpis, kpiRatings) {
+  const kraKpis = kpis.filter(k => k.kra_id === kraId);
+  if (kraKpis.length === 0) return null;
+  
+  let totalWeightedRating = 0;
+  let totalWeight = 0;
+  let hasAnyRating = false;
+  
+  for (const kpi of kraKpis) {
+    const rating = kpiRatings[kpi.id];
+    if (rating !== null && rating !== undefined) {
+      const kpiWeight = Number(kpi.weight || 0);
+      totalWeightedRating += Number(rating) * kpiWeight;
+      totalWeight += kpiWeight;
+      hasAnyRating = true;
+    }
+  }
+  
+  if (!hasAnyRating || totalWeight === 0) return null;
+  return totalWeightedRating / totalWeight;
+}
+
+/**
+ * Goal-Level Normalization
+ * Normalizes ratings ONLY at Goal/Overall level
  * @param {number} quarter - Quarter number (1-4)
  * @param {string} cycleId - Performance cycle ID
  * @param {string} hrUserId - HR user ID performing normalization
@@ -187,7 +138,7 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
   const finalConfig = { ...DEFAULT_CONFIG, ...config };
   
   try {
-    // Fetch all submitted manager reviews for the quarter
+    // Step 1: Fetch all submitted manager reviews with goal raw ratings
     const reviewsQuery = `
       SELECT 
         qmr.id,
@@ -202,23 +153,93 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
         AND qmr.status = 'submitted'
         AND qmr.calculated_overall_rating IS NOT NULL
         AND qmr.calculated_overall_rating > 0
+        AND (qmr.period_type = 'full_quarter'::period_type OR qmr.period_type IS NULL)
     `;
     
     const reviewsResult = await query(reviewsQuery, [cycleId, quarter]);
     const reviews = reviewsResult.rows;
     
-    console.log(`Found ${reviews.length} submitted ratings for quarter ${quarter}, cycle ${cycleId}`);
+    console.log(`Found ${reviews.length} submitted manager reviews for quarter ${quarter}, cycle ${cycleId}`);
     
     if (reviews.length === 0) {
       return { processed: 0, skipped: 0, message: 'No submitted ratings found for this quarter', runId: null };
     }
     
-    // Calculate global min/max for fallback scaling
-    const allRawRatings = reviews.map(r => parseFloat(r.raw_rating));
-    const globalMin = Math.min(...allRawRatings);
-    const globalMax = Math.max(...allRawRatings);
+    // Step 2: Fetch raw KPI and KRA ratings for audit (NOT normalized)
+    const employeeIds = reviews.map(r => r.employee_id);
     
-    // Check existing normalized ratings to skip PUBLISHED ones
+    // Fetch KPI ratings (for audit storage)
+    const kpiRatingsQuery = `
+      SELECT 
+        gmr.goal_id,
+        gmr.rating,
+        gmr.manager_review_id,
+        qmr.employee_id,
+        g.kra_id,
+        g.weight as kpi_weight
+      FROM quarterly_kpi_manager_feedback gmr
+      JOIN quarterly_manager_reviews qmr ON gmr.manager_review_id = qmr.id
+      JOIN goals g ON g.id = gmr.goal_id
+      WHERE qmr.cycle_id = $1
+        AND qmr.quarter = $2
+        AND qmr.status = 'submitted'
+        AND gmr.rating IS NOT NULL
+        AND gmr.rating > 0
+        AND (qmr.period_type = 'full_quarter'::period_type OR qmr.period_type IS NULL)
+    `;
+    
+    const kpiRatingsResult = await query(kpiRatingsQuery, [cycleId, quarter]);
+    const kpiRatings = kpiRatingsResult.rows;
+    
+    // Fetch KRAs and KPIs structure for calculating raw KRA ratings
+    const krasQuery = `
+      SELECT id, weight, employee_id
+      FROM kras
+      WHERE cycle_id = $1
+        AND (period_type = 'full_quarter'::period_type OR period_type IS NULL)
+    `;
+    
+    const krasResult = await query(krasQuery, [cycleId]);
+    const allKras = krasResult.rows;
+    
+    const kpisQuery = `
+      SELECT id, kra_id, weight, employee_id
+      FROM goals
+      WHERE cycle_id = $1 AND kra_id IS NOT NULL
+        AND (period_type = 'full_quarter'::period_type OR period_type IS NULL)
+    `;
+    
+    const kpisResult = await query(kpisQuery, [cycleId]);
+    const allKpis = kpisResult.rows;
+    
+    // Calculate raw KRA ratings for storage (from raw KPIs)
+    const rawKraRatings = new Map(); // employee_id -> {kra_id -> rating}
+    
+    for (const review of reviews) {
+      const employeeId = review.employee_id;
+      const employeeKras = allKras.filter(k => k.employee_id === employeeId);
+      const employeeKpis = allKpis.filter(k => k.employee_id === employeeId);
+      
+      // Get raw KPI ratings for this employee
+      const employeeKpiRatings = {};
+      kpiRatings
+        .filter(k => String(k.employee_id || '').trim() === String(employeeId || '').trim())
+        .forEach(k => {
+          employeeKpiRatings[k.goal_id] = parseFloat(k.rating);
+        });
+      
+      // Calculate raw KRA ratings (from raw KPIs)
+      const rawKras = {};
+      employeeKras.forEach(kra => {
+        const kraRating = calculateKRARating(kra.id, employeeKpis, employeeKpiRatings);
+        if (kraRating !== null) {
+          rawKras[kra.id] = kraRating;
+        }
+      });
+      rawKraRatings.set(employeeId, rawKras);
+    }
+    
+    // Check existing normalized ratings to skip PUBLISHED ones (immutable)
     const existingQuery = `
       SELECT employee_id, status
       FROM normalized_ratings
@@ -227,326 +248,331 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
     const existingResult = await query(existingQuery, [cycleId, quarter]);
     const publishedEmployeeIds = new Set(existingResult.rows.map(r => r.employee_id));
     
+    // Filter out PUBLISHED records (immutable - cannot be modified)
     const reviewsToProcess = reviews.filter(r => !publishedEmployeeIds.has(r.employee_id));
     
+    console.log(`Reviews to process: ${reviewsToProcess.length} (${reviews.length} total, ${reviews.length - reviewsToProcess.length} already published and immutable)`);
+    
     if (reviewsToProcess.length === 0) {
-      return { processed: 0, skipped: reviews.length, message: 'All ratings already published', runId: null };
+      return { 
+        processed: 0, 
+        skipped: reviews.length, 
+        message: 'All ratings already published and are immutable. Cannot rerun normalization on published records.', 
+        runId: null 
+      };
     }
     
-    // Group by manager for Level 1 normalization
-    const managerGroups = new Map();
+    // Step 3: Group employees by manager and by grade
+    const managerGroups = new Map(); // managerId -> [{employeeId, rawRating, grade}]
+    const gradeGroups = new Map();   // grade -> [{employeeId, rawRating, managerId}]
+    
     reviewsToProcess.forEach(review => {
       const managerId = review.manager_id;
+      const grade = review.grade || 'UNKNOWN';
+      const rawRating = parseFloat(review.raw_rating);
+      
+      // Group by manager
       if (!managerGroups.has(managerId)) {
         managerGroups.set(managerId, []);
       }
-      managerGroups.get(managerId).push(review);
-    });
-    
-    // Group by grade for Level 2 normalization
-    const gradeGroups = new Map();
-    reviewsToProcess.forEach(review => {
-      const grade = review.grade || 'UNKNOWN';
+      managerGroups.get(managerId).push({
+        employeeId: review.employee_id,
+        rawRating,
+        grade
+      });
+      
+      // Group by grade
       if (!gradeGroups.has(grade)) {
         gradeGroups.set(grade, []);
       }
-      gradeGroups.get(grade).push(review);
+      gradeGroups.get(grade).push({
+        employeeId: review.employee_id,
+        rawRating,
+        managerId
+      });
     });
     
-    // Level 1: Normalize within each manager's team
-    const managerNormalized = new Map();
-    const managerMetadata = new Map(); // Store lambda, group size, min, max
+    // Step 4: Normalize goal ratings at manager level
+    const managerNormalizedRatings = new Map(); // employeeId -> normalized rating
     
-    for (const [managerId, groupReviews] of managerGroups) {
-      if (groupReviews.length < finalConfig.minGroupSize) {
-        // Too small for full normalization - use global scaling fallback
-        console.log(`Manager ${managerId}: Only ${groupReviews.length} employee(s) (< ${finalConfig.minGroupSize}), using global scaling fallback`);
-        groupReviews.forEach(review => {
-          const scaled = globalScale(parseFloat(review.raw_rating), globalMin, globalMax);
-          managerNormalized.set(review.employee_id, scaled);
-          managerMetadata.set(review.employee_id, {
-            lambda: null,
-            groupSize: groupReviews.length,
-            minValue: globalMin,
-            maxValue: globalMax,
-            method: 'global_scaling'
-          });
+    for (const [managerId, employees] of managerGroups) {
+      const rawRatings = employees.map(e => e.rawRating);
+      
+      if (employees.length < finalConfig.minGroupSize) {
+        // Group too small - use raw ratings
+        employees.forEach(emp => {
+          managerNormalizedRatings.set(emp.employeeId, emp.rawRating);
         });
         continue;
       }
       
-      const rawRatings = groupReviews.map(r => parseFloat(r.raw_rating));
-      console.log(`Manager ${managerId}: Normalizing ${groupReviews.length} employees with raw ratings:`, rawRatings);
+      // Normalize the group
+      const normalized = normalizeGroup(rawRatings, finalConfig.lambda);
       
-      // Apply winsorization if enabled
-      let processedRatings = rawRatings;
-      if (finalConfig.useWinsorization) {
-        processedRatings = winsorize(rawRatings, finalConfig.winsorizationPercentileLow, finalConfig.winsorizationPercentileHigh);
-        console.log(`Manager ${managerId}: After winsorization:`, processedRatings);
-      }
-      
-      const { values: positiveRatings } = ensurePositive(processedRatings);
-      
-      // Find optimal lambda
-      const lambda = findOptimalLambda(positiveRatings);
-      console.log(`Manager ${managerId}: Optimal lambda = ${lambda.toFixed(3)}`);
-      
-      // Apply Box-Cox transform
-      const transformed = positiveRatings.map(v => boxCoxTransform(v, lambda));
-      console.log(`Manager ${managerId}: After Box-Cox:`, transformed.map(v => v.toFixed(3)));
-      
-      // Min-Max scale to [1, 5]
-      const min = Math.min(...transformed);
-      const max = Math.max(...transformed);
-      const scaled = transformed.map(v => minMaxScale(v, min, max));
-      console.log(`Manager ${managerId}: After Min-Max scaling [1-5]:`, scaled.map(v => v.toFixed(3)));
-      
-      // Map back to employees and store metadata
-      groupReviews.forEach((review, index) => {
-        managerNormalized.set(review.employee_id, scaled[index]);
-        managerMetadata.set(review.employee_id, {
-          lambda: lambda,
-          groupSize: groupReviews.length,
-          minValue: min,
-          maxValue: max,
-          method: 'boxcox_minmax'
-        });
+      // Map normalized ratings back to employees
+      employees.forEach((emp, index) => {
+        managerNormalizedRatings.set(emp.employeeId, normalized[index]);
       });
     }
     
-    // Level 2: Normalize within each grade/band
-    const gradeNormalized = new Map();
-    const gradeMetadata = new Map();
+    // Step 5: Normalize goal ratings at grade level
+    const gradeNormalizedRatings = new Map(); // employeeId -> normalized rating
     
-    for (const [grade, groupReviews] of gradeGroups) {
-      if (groupReviews.length < finalConfig.minGroupSize) {
-        // Too small for full normalization - use global scaling fallback
-        console.log(`Grade ${grade}: Only ${groupReviews.length} employee(s) (< ${finalConfig.minGroupSize}), using global scaling fallback`);
-        groupReviews.forEach(review => {
-          const scaled = globalScale(parseFloat(review.raw_rating), globalMin, globalMax);
-          gradeNormalized.set(review.employee_id, scaled);
-          gradeMetadata.set(review.employee_id, {
-            lambda: null,
-            groupSize: groupReviews.length,
-            minValue: globalMin,
-            maxValue: globalMax,
-            method: 'global_scaling'
-          });
+    for (const [grade, employees] of gradeGroups) {
+      const rawRatings = employees.map(e => e.rawRating);
+      
+      if (employees.length < finalConfig.minGroupSize) {
+        // Group too small - use raw ratings
+        employees.forEach(emp => {
+          gradeNormalizedRatings.set(emp.employeeId, emp.rawRating);
         });
         continue;
       }
       
-      const rawRatings = groupReviews.map(r => parseFloat(r.raw_rating));
-      console.log(`Grade ${grade}: Normalizing ${groupReviews.length} employees with raw ratings:`, rawRatings);
+      // Normalize the group
+      const normalized = normalizeGroup(rawRatings, finalConfig.lambda);
       
-      // Apply winsorization if enabled
-      let processedRatings = rawRatings;
-      if (finalConfig.useWinsorization) {
-        processedRatings = winsorize(rawRatings, finalConfig.winsorizationPercentileLow, finalConfig.winsorizationPercentileHigh);
-        console.log(`Grade ${grade}: After winsorization:`, processedRatings);
-      }
-      
-      const { values: positiveRatings } = ensurePositive(processedRatings);
-      
-      // Find optimal lambda
-      const lambda = findOptimalLambda(positiveRatings);
-      console.log(`Grade ${grade}: Optimal lambda = ${lambda.toFixed(3)}`);
-      
-      // Apply Box-Cox transform
-      const transformed = positiveRatings.map(v => boxCoxTransform(v, lambda));
-      console.log(`Grade ${grade}: After Box-Cox:`, transformed.map(v => v.toFixed(3)));
-      
-      // Min-Max scale to [1, 5]
-      const min = Math.min(...transformed);
-      const max = Math.max(...transformed);
-      const scaled = transformed.map(v => minMaxScale(v, min, max));
-      console.log(`Grade ${grade}: After Min-Max scaling [1-5]:`, scaled.map(v => v.toFixed(3)));
-      
-      // Map back to employees and store metadata
-      groupReviews.forEach((review, index) => {
-        gradeNormalized.set(review.employee_id, scaled[index]);
-        gradeMetadata.set(review.employee_id, {
-          lambda: lambda,
-          groupSize: groupReviews.length,
-          minValue: min,
-          maxValue: max,
-          method: 'boxcox_minmax'
-        });
+      // Map normalized ratings back to employees
+      employees.forEach((emp, index) => {
+        gradeNormalizedRatings.set(emp.employeeId, normalized[index]);
       });
     }
     
-    // Combine results: weighted average (configurable weights)
+    // Step 6: Combine manager and grade normalized ratings
     const normalizedResults = [];
+    
     for (const review of reviewsToProcess) {
-      const managerRating = managerNormalized.get(review.employee_id);
-      const gradeRating = gradeNormalized.get(review.employee_id);
-      const managerMeta = managerMetadata.get(review.employee_id);
-      const gradeMeta = gradeMetadata.get(review.employee_id);
+      const employeeId = review.employee_id;
+      const rawOverallRating = parseFloat(review.raw_rating);
       
-      // Determine final rating based on what's available
-      let finalRating;
-      if (managerRating === undefined && gradeRating === undefined) {
-        // Neither available (shouldn't happen, but fallback)
-        finalRating = parseFloat(review.raw_rating);
-      } else if (managerRating === undefined) {
-        // Only grade available
-        finalRating = parseFloat(gradeRating);
-      } else if (gradeRating === undefined) {
-        // Only manager available
-        finalRating = parseFloat(managerRating);
+      const managerNormalized = managerNormalizedRatings.get(employeeId);
+      const gradeNormalized = gradeNormalizedRatings.get(employeeId);
+      
+      // Combine manager and grade normalized ratings
+      let finalRating = null;
+      if (managerNormalized !== undefined && gradeNormalized !== undefined) {
+        finalRating = finalConfig.managerWeight * managerNormalized + 
+                     finalConfig.gradeWeight * gradeNormalized;
+      } else if (managerNormalized !== undefined) {
+        finalRating = managerNormalized;
+      } else if (gradeNormalized !== undefined) {
+        finalRating = gradeNormalized;
       } else {
-        // Both available: weighted average
-        finalRating = finalConfig.managerWeight * parseFloat(managerRating) + 
-                     finalConfig.gradeWeight * parseFloat(gradeRating);
+        finalRating = rawOverallRating; // Fallback to raw
       }
       
-      // Apply no-shock safeguard
-      const rawRatingFloat = parseFloat(review.raw_rating);
-      finalRating = applyNoShockSafeguard(finalRating, rawRatingFloat, finalConfig.maxChangeFromRaw);
+      // Prepare raw KPI ratings array for storage (for audit)
+      const employeeKpiRatingsArray = kpiRatings
+        .filter(k => String(k.employee_id || '').trim() === String(employeeId || '').trim())
+        .map(k => ({
+          goal_id: k.goal_id,
+          rating: parseFloat(k.rating),
+          weight: parseFloat(k.kpi_weight || 0)
+        }));
       
-      console.log(`Employee ${review.employee_id}: Raw=${rawRatingFloat.toFixed(3)}, Manager=${managerRating?.toFixed(3) || 'N/A'}, Grade=${gradeRating?.toFixed(3) || 'N/A'}, Final=${finalRating.toFixed(3)}`);
+      // Prepare raw KRA ratings array for storage (for audit)
+      const rawKrasForEmployee = rawKraRatings.get(employeeId) || {};
+      const employeeKras = allKras.filter(k => k.employee_id === employeeId);
+      const employeeKraRatingsArray = employeeKras.map(kra => ({
+        kra_id: kra.id,
+        rating: rawKrasForEmployee[kra.id] ?? null,
+        weight: parseFloat(kra.weight || 0)
+      }));
       
       normalizedResults.push({
-        employee_id: review.employee_id,
+        employee_id: employeeId,
         manager_id: review.manager_id,
-        raw_rating: rawRatingFloat,
-        boxcox_manager_level_rating: managerRating || rawRatingFloat,
-        boxcox_grade_level_rating: gradeRating || rawRatingFloat,
-        final_normalized_rating: finalRating, // Keep high precision, round only at display
-        manager_lambda: managerMeta?.lambda ?? null,
-        manager_group_size: managerMeta?.groupSize ?? null,
-        manager_min_value: managerMeta?.minValue ?? null,
-        manager_max_value: managerMeta?.maxValue ?? null,
-        grade_lambda: gradeMeta?.lambda ?? null,
-        grade_group_size: gradeMeta?.groupSize ?? null,
-        grade_min_value: gradeMeta?.minValue ?? null,
-        grade_max_value: gradeMeta?.maxValue ?? null,
-        manager_weight: finalConfig.managerWeight,
-        grade_weight: finalConfig.gradeWeight
+        raw_rating: rawOverallRating,
+        boxcox_manager_level_rating: managerNormalized ?? null,
+        boxcox_grade_level_rating: gradeNormalized ?? null,
+        final_normalized_rating: finalRating,
+        normalized_kpi_ratings: null, // KPIs not normalized
+        normalized_kra_ratings: null, // KRAs not normalized
+        raw_kpi_ratings: employeeKpiRatingsArray,
+        raw_kra_ratings: employeeKraRatingsArray
       });
     }
     
-    // Calculate summary statistics for audit
-    const avgRaw = allRawRatings.reduce((a, b) => a + b, 0) / allRawRatings.length;
-    const avgNormalized = normalizedResults.reduce((sum, r) => sum + r.final_normalized_rating, 0) / normalizedResults.length;
-    const minRaw = globalMin;
-    const maxRaw = globalMax;
-    const minNormalized = Math.min(...normalizedResults.map(r => r.final_normalized_rating));
-    const maxNormalized = Math.max(...normalizedResults.map(r => r.final_normalized_rating));
+    console.log(`Created ${normalizedResults.length} normalized results`);
+    
+    // Calculate summary statistics
+    const allRawRatings = reviewsToProcess.map(r => parseFloat(r.raw_rating));
+    const avgRaw = allRawRatings.length > 0 
+      ? allRawRatings.reduce((a, b) => a + b, 0) / allRawRatings.length 
+      : null;
+    const avgNormalized = normalizedResults.length > 0
+      ? normalizedResults.reduce((sum, r) => sum + (r.final_normalized_rating || 0), 0) / normalizedResults.length
+      : null;
+    const minRaw = allRawRatings.length > 0 ? Math.min(...allRawRatings) : null;
+    const maxRaw = allRawRatings.length > 0 ? Math.max(...allRawRatings) : null;
+    const minNormalized = normalizedResults.length > 0 
+      ? Math.min(...normalizedResults.map(r => r.final_normalized_rating || 0))
+      : null;
+    const maxNormalized = normalizedResults.length > 0 
+      ? Math.max(...normalizedResults.map(r => r.final_normalized_rating || 0))
+      : null;
     
     // Create normalization run record
     const runInsertQuery = `
       INSERT INTO normalization_runs (
         performance_cycle_id, quarter, run_by, total_employees, processed_count, skipped_count,
-        manager_weight, grade_weight, min_group_size, use_winsorization,
-        winsorization_percentile_low, winsorization_percentile_high, max_change_from_raw,
+        manager_weight, grade_weight, min_group_size,
         avg_raw_rating, avg_normalized_rating, min_raw_rating, max_raw_rating,
         min_normalized_rating, max_normalized_rating
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
       RETURNING id
     `;
     
-    const runResult = await query(runInsertQuery, [
-      cycleId, quarter, hrUserId, reviews.length, normalizedResults.length,
+    const runParams = [
+      cycleId ?? null, 
+      quarter ?? null, 
+      hrUserId ?? null, 
+      reviews.length, 
+      normalizedResults.length,
       reviews.length - reviewsToProcess.length,
-      finalConfig.managerWeight, finalConfig.gradeWeight, finalConfig.minGroupSize,
-      finalConfig.useWinsorization, finalConfig.winsorizationPercentileLow,
-      finalConfig.winsorizationPercentileHigh, finalConfig.maxChangeFromRaw,
-      avgRaw, avgNormalized, minRaw, maxRaw, minNormalized, maxNormalized
-    ]);
+      finalConfig.managerWeight ?? 0.5, 
+      finalConfig.gradeWeight ?? 0.5, 
+      finalConfig.minGroupSize ?? 3,
+      (avgRaw !== undefined && !isNaN(avgRaw)) ? avgRaw : null, 
+      (avgNormalized !== undefined && !isNaN(avgNormalized)) ? avgNormalized : null, 
+      (minRaw !== undefined && !isNaN(minRaw)) ? minRaw : null, 
+      (maxRaw !== undefined && !isNaN(maxRaw)) ? maxRaw : null, 
+      (minNormalized !== undefined && !isNaN(minNormalized)) ? minNormalized : null, 
+      (maxNormalized !== undefined && !isNaN(maxNormalized)) ? maxNormalized : null
+    ];
+    
+    let runResult;
+    try {
+      runResult = await query(runInsertQuery, runParams);
+    } catch (error) {
+      console.error('Error inserting normalization run:', error);
+      throw error;
+    }
     
     const runId = runResult.rows[0].id;
     
     // Upsert to normalized_ratings table
+    console.log(`Starting upsert of ${normalizedResults.length} normalized results...`);
     let processed = 0;
+    let skippedPublished = 0;
+    let errorCount = 0;
+    const errors = [];
+    
     for (const result of normalizedResults) {
-      // First check if record exists and is PUBLISHED
-      const existingCheck = await query(
-        `SELECT id, status FROM normalized_ratings 
-         WHERE employee_id = $1 AND performance_cycle_id = $2 AND quarter = $3`,
-        [result.employee_id, cycleId, quarter]
-      );
-      
-      // Skip if already published
-      if (existingCheck.rows.length > 0 && existingCheck.rows[0].status === 'PUBLISHED') {
-        continue;
-      }
-      
-      const upsertQuery = `
-        INSERT INTO normalized_ratings (
-          employee_id, manager_id, performance_cycle_id, quarter,
-          raw_rating, boxcox_manager_level_rating, boxcox_grade_level_rating,
-          final_normalized_rating, status, updated_by_hr, updated_at,
-          manager_lambda, manager_group_size, manager_min_value, manager_max_value,
-          grade_lambda, grade_group_size, grade_min_value, grade_max_value,
-          manager_weight, grade_weight
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DRAFT', $9, NOW(), $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-        ON CONFLICT (employee_id, performance_cycle_id, quarter)
-        DO UPDATE SET
-          raw_rating = EXCLUDED.raw_rating,
-          boxcox_manager_level_rating = EXCLUDED.boxcox_manager_level_rating,
-          boxcox_grade_level_rating = EXCLUDED.boxcox_grade_level_rating,
-          final_normalized_rating = EXCLUDED.final_normalized_rating,
-          updated_by_hr = EXCLUDED.updated_by_hr,
-          updated_at = EXCLUDED.updated_at,
-          manager_lambda = EXCLUDED.manager_lambda,
-          manager_group_size = EXCLUDED.manager_group_size,
-          manager_min_value = EXCLUDED.manager_min_value,
-          manager_max_value = EXCLUDED.manager_max_value,
-          grade_lambda = EXCLUDED.grade_lambda,
-          grade_group_size = EXCLUDED.grade_group_size,
-          grade_min_value = EXCLUDED.grade_min_value,
-          grade_max_value = EXCLUDED.grade_max_value,
-          manager_weight = EXCLUDED.manager_weight,
-          grade_weight = EXCLUDED.grade_weight,
-          status = CASE 
-            WHEN normalized_ratings.status = 'PUBLISHED' THEN normalized_ratings.status
-            ELSE 'DRAFT'
-          END
-        RETURNING id
-      `;
-      
       try {
-        const upsertResult = await query(upsertQuery, [
-          result.employee_id,
-          result.manager_id,
-          cycleId,
-          quarter,
-          result.raw_rating,
-          result.boxcox_manager_level_rating,
-          result.boxcox_grade_level_rating,
-          result.final_normalized_rating,
-          hrUserId,
-          result.manager_lambda,
-          result.manager_group_size,
-          result.manager_min_value,
-          result.manager_max_value,
-          result.grade_lambda,
-          result.grade_group_size,
-          result.grade_min_value,
-          result.grade_max_value,
-          result.manager_weight,
-          result.grade_weight
-        ]);
+        // Check if record exists and is PUBLISHED
+        const existingCheck = await query(
+          `SELECT id, status FROM normalized_ratings 
+           WHERE employee_id = $1 AND performance_cycle_id = $2 AND quarter = $3`,
+          [result.employee_id ?? null, cycleId ?? null, quarter ?? null]
+        );
+        
+        // Skip if already published
+        if (existingCheck.rows.length > 0 && existingCheck.rows[0].status === 'PUBLISHED') {
+          skippedPublished++;
+          continue;
+        }
+        
+        // Upsert
+        const existingCheck2 = await query(
+          `SELECT id, status FROM normalized_ratings 
+           WHERE employee_id = $1 AND performance_cycle_id = $2 AND quarter = $3`,
+          [result.employee_id ?? null, cycleId ?? null, quarter ?? null]
+        );
+        
+        let upsertResult;
+        if (existingCheck2.rows.length > 0) {
+          // Update existing record
+          const existingStatus = existingCheck2.rows[0].status;
+          const updateQuery = `
+            UPDATE normalized_ratings SET
+              raw_rating = $1,
+              boxcox_manager_level_rating = $2,
+              boxcox_grade_level_rating = $3,
+              final_normalized_rating = $4,
+              updated_by_hr = $5,
+              updated_at = NOW(),
+              normalized_kpi_ratings = $6,
+              normalized_kra_ratings = $7,
+              raw_kpi_ratings = $8,
+              raw_kra_ratings = $9,
+              status = CASE 
+                WHEN $10 = 'PUBLISHED' THEN $10
+                ELSE 'DRAFT'
+              END
+            WHERE employee_id = $11 AND performance_cycle_id = $12 AND quarter = $13
+            RETURNING id
+          `;
+          upsertResult = await query(updateQuery, [
+            result.raw_rating,
+            result.boxcox_manager_level_rating,
+            result.boxcox_grade_level_rating,
+            result.final_normalized_rating,
+            hrUserId,
+            null, // normalized_kpi_ratings - KPIs not normalized
+            null, // normalized_kra_ratings - KRAs not normalized
+            JSON.stringify(result.raw_kpi_ratings || []),
+            JSON.stringify(result.raw_kra_ratings || []),
+            existingStatus,
+            result.employee_id,
+            cycleId,
+            quarter
+          ]);
+        } else {
+          // Insert new record
+          const insertQuery = `
+            INSERT INTO normalized_ratings (
+              employee_id, manager_id, performance_cycle_id, quarter,
+              raw_rating, boxcox_manager_level_rating, boxcox_grade_level_rating,
+              final_normalized_rating, status, updated_by_hr, updated_at,
+              normalized_kpi_ratings, normalized_kra_ratings, raw_kpi_ratings, raw_kra_ratings
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'DRAFT', $9, NOW(), $10, $11, $12, $13)
+            RETURNING id
+          `;
+          upsertResult = await query(insertQuery, [
+            result.employee_id,
+            result.manager_id,
+            cycleId,
+            quarter,
+            result.raw_rating ?? null,
+            result.boxcox_manager_level_rating ?? null,
+            result.boxcox_grade_level_rating ?? null,
+            result.final_normalized_rating ?? null,
+            hrUserId,
+            null, // normalized_kpi_ratings - KPIs not normalized
+            null, // normalized_kra_ratings - KRAs not normalized
+            JSON.stringify(result.raw_kpi_ratings || []),
+            JSON.stringify(result.raw_kra_ratings || [])
+          ]);
+        }
         
         if (upsertResult.rows.length > 0) {
           processed++;
+        } else {
+          errorCount++;
+          errors.push(`No rows returned for employee ${result.employee_id}`);
         }
       } catch (upsertError) {
-        console.error(`Error upserting normalized rating for employee ${result.employee_id}:`, upsertError);
-        // Continue with next rating instead of failing completely
+        errorCount++;
+        const errorMsg = `Error upserting normalized rating for employee ${result.employee_id}: ${upsertError.message}`;
+        errors.push(errorMsg);
+        console.error(errorMsg);
       }
     }
     
-    console.log(`Normalization complete: processed ${processed}, skipped ${reviews.length - reviewsToProcess.length}, runId: ${runId}`);
+    const totalSkipped = skippedPublished + (reviews.length - reviewsToProcess.length);
+    console.log(`Normalization complete: processed ${processed}, skipped ${totalSkipped}, errors: ${errorCount}, runId: ${runId}`);
     
     return {
       processed,
-      skipped: reviews.length - reviewsToProcess.length,
-      message: `Normalized ${processed} ratings`,
-      runId
+      skipped: totalSkipped,
+      message: processed > 0 
+        ? `Normalized ${processed} goal-level ratings${errorCount > 0 ? ` (${errorCount} errors)` : ''}`
+        : `No ratings processed. ${normalizedResults.length > 0 ? 'Check errors in logs.' : 'No normalized results generated.'}`,
+      runId,
+      errors: errorCount > 0 ? errors : undefined
     };
   } catch (error) {
     console.error('Error in normalizeRatings:', error);

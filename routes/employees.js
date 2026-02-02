@@ -1,6 +1,7 @@
 import express from 'express';
 import { query } from '../config/database.js';
 import { authMiddleware, requireRole } from '../middleware/auth.js';
+import * as transitionService from '../services/transitionService.js';
 
 const router = express.Router();
 
@@ -84,6 +85,202 @@ router.get('/me', authMiddleware, async (req, res) => {
     }
     res.json({ data: result.rows[0] });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/employees/users-with-roles - Get all users with their roles and employee data
+router.get('/users-with-roles', authMiddleware, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT 
+        p.id,
+        p.email,
+        p.role,
+        e.id as employee_id,
+        e.emp_code,
+        e.full_name as employee_full_name,
+        e.department,
+        e.business_unit,
+        e.grade,
+        e.location,
+        e.status as employee_status,
+        e.date_of_joining,
+        e.manager_code,
+        e.sub_department,
+        e.created_at as employee_created_at,
+        e.updated_at as employee_updated_at
+      FROM profiles p
+      LEFT JOIN employees e ON e.profile_id = p.id
+      ORDER BY p.email`
+    );
+    
+    const usersWithRoles = result.rows.map(row => {
+      const user = {
+        id: row.id,
+        email: row.email,
+        roles: [row.role] // Return role as array to match interface
+      };
+      
+      // Add employee data if it exists
+      if (row.employee_id) {
+        user.employee = {
+          id: row.employee_id,
+          emp_code: row.emp_code,
+          profile_id: row.id,
+          full_name: row.employee_full_name,
+          email: row.email,
+          department: row.department,
+          business_unit: row.business_unit,
+          grade: row.grade,
+          location: row.location,
+          manager_code: row.manager_code,
+          status: row.employee_status,
+          date_of_joining: row.date_of_joining,
+          sub_department: row.sub_department,
+          created_at: row.employee_created_at,
+          updated_at: row.employee_updated_at
+        };
+      }
+      
+      return user;
+    });
+    
+    res.json({ data: usersWithRoles });
+  } catch (error) {
+    console.error('Get users with roles error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/employees/users/:userId/roles - Add/update role for a user
+router.post('/users/:userId/roles', authMiddleware, requireRole(['hr_admin', 'system_admin']), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+    
+    if (!role) {
+      return res.status(400).json({ error: 'Role is required' });
+    }
+    
+    // Validate role
+    const validRoles = ['employee', 'manager', 'dept_head', 'hr_admin', 'hrbp', 'system_admin'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` });
+    }
+    
+    // Check if user exists
+    const userCheck = await query(
+      'SELECT id, email FROM profiles WHERE id = $1',
+      [userId]
+    );
+    
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Update the role
+    const result = await query(
+      'UPDATE profiles SET role = $1::app_role, updated_at = NOW() WHERE id = $2 RETURNING id, email, role, created_at, updated_at',
+      [role, userId]
+    );
+    
+    res.json({ 
+      data: {
+        id: result.rows[0].id,
+        user_id: result.rows[0].id,
+        role: result.rows[0].role,
+        created_at: result.rows[0].created_at
+      }
+    });
+  } catch (error) {
+    console.error('Add role error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/employees/users/:userId/roles/:role - Remove role from a user (sets to default 'employee')
+router.delete('/users/:userId/roles/:role', authMiddleware, requireRole(['hr_admin', 'system_admin']), async (req, res) => {
+  try {
+    const { userId, role } = req.params;
+    
+    // Validate role
+    const validRoles = ['employee', 'manager', 'dept_head', 'hr_admin', 'hrbp', 'system_admin'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` });
+    }
+    
+    // Check if user exists
+    const userCheck = await query(
+      'SELECT id, email, role FROM profiles WHERE id = $1',
+      [userId]
+    );
+    
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const currentRole = userCheck.rows[0].role;
+    
+    // If the role being removed is the current role, set to default 'employee'
+    // Otherwise, just confirm the role was removed (since we only store one role)
+    if (currentRole === role) {
+      const result = await query(
+        'UPDATE profiles SET role = $1::app_role, updated_at = NOW() WHERE id = $2 RETURNING id, email, role, created_at, updated_at',
+        ['employee', userId]
+      );
+      
+      res.json({ 
+        message: 'Role removed, user set to default role',
+        data: {
+          id: result.rows[0].id,
+          user_id: result.rows[0].id,
+          role: result.rows[0].role,
+          created_at: result.rows[0].created_at
+        }
+      });
+    } else {
+      // Role doesn't match current role, return success anyway
+      res.json({ 
+        message: 'Role not found for this user',
+        data: {
+          id: userCheck.rows[0].id,
+          user_id: userCheck.rows[0].id,
+          role: currentRole,
+          created_at: userCheck.rows[0].created_at || new Date()
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Remove role error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/employees/search - Search employees by email or employee code
+router.get('/search', authMiddleware, async (req, res) => {
+  try {
+    const { q, limit = 10 } = req.query;
+    
+    if (!q || q.length < 2) {
+      return res.json({ data: [] });
+    }
+    
+    const searchTerm = `%${q}%`;
+    
+    const result = await query(
+      `SELECT id, full_name, email, emp_code, department, grade, status
+       FROM employees
+       WHERE status = 'active'
+         AND (emp_code ILIKE $1 OR email ILIKE $2)
+       ORDER BY full_name
+       LIMIT $3`,
+      [searchTerm, searchTerm, parseInt(limit)]
+    );
+    
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Search employees error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -597,6 +794,104 @@ router.put('/:id/manager-review/admin-override', authMiddleware, requireRole(['h
     res.json({ data: managerReview });
   } catch (error) {
     console.error('Admin override manager review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== MID-QUARTER TRANSITIONS ==========
+
+// POST /api/employees/:id/transitions - Create transition
+router.post('/:id/transitions', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { id: employeeId } = req.params;
+    const { cycle_id, quarter, transition_type, transition_date, new_manager_id, new_department, new_grade, new_project } = req.body;
+    
+    if (!cycle_id || !quarter || !transition_type || !transition_date) {
+      return res.status(400).json({ error: 'Missing required fields: cycle_id, quarter, transition_type, transition_date' });
+    }
+    
+    if (quarter < 1 || quarter > 4) {
+      return res.status(400).json({ error: 'Quarter must be between 1 and 4' });
+    }
+    
+    const transition = await transitionService.createTransition(
+      employeeId,
+      cycle_id,
+      quarter,
+      {
+        transition_type,
+        transition_date,
+        new_manager_id,
+        new_department,
+        new_grade,
+        new_project
+      },
+      req.user.userId
+    );
+    
+    res.status(201).json({ data: transition });
+  } catch (error) {
+    console.error('Create transition error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/employees/:id/transitions - Get transitions for employee
+router.get('/:id/transitions', authMiddleware, async (req, res) => {
+  try {
+    const { id: employeeId } = req.params;
+    const { cycle_id, quarter } = req.query;
+    
+    const transitions = await transitionService.getEmployeeTransitions(
+      employeeId,
+      cycle_id || null,
+      quarter ? parseInt(quarter) : null
+    );
+    
+    res.json({ data: transitions });
+  } catch (error) {
+    console.error('Get transitions error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/employees/:id/transitions/:transitionId - Get specific transition
+router.get('/:id/transitions/:transitionId', authMiddleware, async (req, res) => {
+  try {
+    const { transitionId } = req.params;
+    
+    const transition = await transitionService.getTransitionById(transitionId);
+    
+    if (!transition) {
+      return res.status(404).json({ error: 'Transition not found' });
+    }
+    
+    res.json({ data: transition });
+  } catch (error) {
+    console.error('Get transition error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/employees/:id/transitions/:transitionId/status - Update transition status
+router.put('/:id/transitions/:transitionId/status', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { transitionId } = req.params;
+    const { old_period_reviewed, new_period_goals_set, new_period_approved } = req.body;
+    
+    const transition = await transitionService.updateTransitionStatus(transitionId, {
+      old_period_reviewed,
+      new_period_goals_set,
+      new_period_approved
+    });
+    
+    if (!transition) {
+      return res.status(404).json({ error: 'Transition not found' });
+    }
+    
+    res.json({ data: transition });
+  } catch (error) {
+    console.error('Update transition status error:', error);
     res.status(500).json({ error: error.message });
   }
 });

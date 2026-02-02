@@ -8,7 +8,7 @@ const router = express.Router();
 // GET /api/kras - Get KRAs with filters
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, status, quarter } = req.query;
+    const { employee_id, cycle_id, status, quarter, period_type, transition_id } = req.query;
     
     let sql = 'SELECT * FROM kras WHERE 1=1';
     const params = [];
@@ -29,6 +29,17 @@ router.get('/', authMiddleware, async (req, res) => {
     if (quarter) {
       sql += ` AND quarter = $${idx++}`;
       params.push(parseInt(quarter));
+    }
+    if (period_type) {
+      sql += ` AND period_type = $${idx++}::period_type`;
+      params.push(period_type);
+    }
+    if (transition_id) {
+      sql += ` AND transition_id = $${idx++}`;
+      params.push(transition_id);
+    } else if (period_type && period_type !== 'full_quarter') {
+      // If period_type is specified but not full_quarter, ensure we filter by transition_id
+      sql += ` AND transition_id IS NOT NULL`;
     }
 
     sql += ' ORDER BY created_at ASC';
