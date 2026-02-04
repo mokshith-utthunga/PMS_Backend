@@ -2,8 +2,9 @@ import express from 'express';
 import { query } from '../config/database.js';
 import { authMiddleware, requireRole } from '../middleware/auth.js';
 import { normalizeRatings } from '../services/normalizationService.js';
-import { applyCalibration } from '../services/calibrationService.js';
+import { applyCalibration, isCalibrationEnabled } from '../services/calibrationService.js';
 import { checkManagerOrDelegate } from './delegations.js';
+import { canPerformTransitionActions, getManagerRoleForTransition } from '../services/transitionService.js';
 
 const router = express.Router();
 
@@ -198,30 +199,129 @@ router.get('/quarterly-self-reviews', authMiddleware, async (req, res) => {
 // POST /api/evaluations/quarterly-self-reviews
 router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, quarter, overall_rating, overall_comments, status } = req.body;
+    const { employee_id, cycle_id, quarter, overall_rating, overall_comments, status, period_type, transition_id, period_start_date, period_end_date } = req.body;
     
+    // Validate and parse quarter to integer
+    if (!quarter) {
+      return res.status(400).json({ error: 'quarter is required' });
+    }
+    const quarterNum = parseInt(quarter);
+    if (isNaN(quarterNum) || quarterNum < 1 || quarterNum > 4) {
+      return res.status(400).json({ error: 'quarter must be a number between 1 and 4' });
+    }
+    
+    // Auto-detect transition if not explicitly provided
+    let periodType = period_type || 'full_quarter';
+    let transitionId = transition_id || null;
+    let periodStartDate = period_start_date || null;
+    let periodEndDate = period_end_date || null;
+    
+    // If transition exists but period_type not provided, determine it based on current date
+    if (employee_id && cycle_id && !period_type && !transition_id) {
+      const transitionResult = await query(
+        `SELECT id, transition_date
+         FROM employee_quarter_transitions 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+        [employee_id, cycle_id, quarterNum]
+      );
+
+      if (transitionResult.rows.length > 0) {
+        const transition = transitionResult.rows[0];
+        transitionId = transition.id;
+        const transitionDate = new Date(transition.transition_date);
+        const now = new Date();
+        transitionDate.setHours(0, 0, 0, 0);
+        
+        // Get quarter date range from quarterly_cycles table
+        const quarterRange = await query(
+          `SELECT quarter_start_date, quarter_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarterNum]
+        );
+        
+        if (quarterRange.rows.length > 0) {
+          const quarterStart = new Date(quarterRange.rows[0].quarter_start_date);
+          const quarterEnd = new Date(quarterRange.rows[0].quarter_end_date);
+          
+          if (now >= transitionDate) {
+            // Review is being created after transition, mark as post_transition
+            periodType = 'post_transition';
+            // Format transition date directly to avoid timezone issues
+            // transition.transition_date is already a date string from DB, use it directly
+            periodStartDate = transition.transition_date instanceof Date 
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string' 
+                ? transition.transition_date.split('T')[0] 
+                : transitionDate.toISOString().split('T')[0]);
+            periodEndDate = quarterEnd.toISOString().split('T')[0];
+          } else {
+            // Review is being created before transition, mark as pre_transition
+            periodType = 'pre_transition';
+            periodStartDate = quarterStart.toISOString().split('T')[0];
+            // For pre-transition end date, use the transition date itself (not transition date - 1)
+            // Format transition date directly to avoid timezone issues
+            periodEndDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+          }
+        }
+      }
+    }
+    
+    // Use the unique constraint that includes period_type and transition_id
+    // The constraint is: (employee_id, cycle_id, quarter, period_type, COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))
     const result = await query(
-      `INSERT INTO quarterly_self_reviews (id, employee_id, cycle_id, quarter, overall_rating, overall_comments, status, submitted_at, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
+      `INSERT INTO quarterly_self_reviews (
+        id, employee_id, cycle_id, quarter, overall_rating, overall_comments, status, 
+        period_type, transition_id, period_start_date, period_end_date,
+        submitted_at, created_at, updated_at
+      )
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7::period_type, $8, $9, $10, $11, NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter, period_type, (COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET
          overall_rating = EXCLUDED.overall_rating,
          overall_comments = EXCLUDED.overall_comments,
          status = EXCLUDED.status,
+         period_start_date = COALESCE(EXCLUDED.period_start_date, quarterly_self_reviews.period_start_date),
+         period_end_date = COALESCE(EXCLUDED.period_end_date, quarterly_self_reviews.period_end_date),
          submitted_at = CASE WHEN EXCLUDED.status = 'submitted' THEN NOW() ELSE quarterly_self_reviews.submitted_at END,
          updated_at = NOW()
        RETURNING *`,
       [
         employee_id ?? null,
         cycle_id ?? null,
-        quarter ?? null,
+        quarterNum, // Use parsed integer, not raw quarter
         overall_rating ?? null,
         overall_comments ?? null,
         status || 'pending',
+        periodType,
+        transitionId,
+        periodStartDate,
+        periodEndDate,
         status === 'submitted' ? new Date() : null
       ]
     );
-    res.json({ data: result.rows[0] });
+    // Return response with transition info for frontend date validation bypass
+    const responseData = result.rows[0];
+    if (transitionId) {
+      // Check if we're within quarter dates (required constraint for transition actions)
+      const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
+      if (canPerform) {
+        responseData.has_active_transition = true;
+        responseData.date_validation_bypassed = true; // Frontend can use this to bypass date checks
+      } else {
+        // Transition exists but we're outside quarter dates - don't allow
+        return res.status(400).json({ 
+          error: 'Actions for employees with transitions are only allowed within the current quarter dates' 
+        });
+      }
+    }
+    
+    res.json({ data: responseData });
   } catch (error) {
+    console.error('Error creating/updating quarterly self review:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -326,7 +426,20 @@ router.post('/quarterly-kpi-progress/bulk', authMiddleware, async (req, res) => 
 // GET /api/evaluations/quarterly-manager-reviews
 router.get('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, quarter } = req.query;
+    const { employee_id, cycle_id, quarter, period_type, transition_id } = req.query;
+    
+    // Get current user's employee ID (for manager role check)
+    let managerId = null;
+    if (employee_id && cycle_id && quarter) {
+      // Only check manager role if viewing another employee's data
+      const empResult = await query(
+        'SELECT id FROM employees WHERE profile_id = $1',
+        [req.user.userId]
+      );
+      if (empResult.rows.length > 0) {
+        managerId = empResult.rows[0].id;
+      }
+    }
     
     let sql = 'SELECT * FROM quarterly_manager_reviews WHERE 1=1';
     const params = [];
@@ -342,7 +455,33 @@ router.get('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
     }
     if (quarter && quarter !== 'null') {
       sql += ` AND quarter = $${idx++}`;
-      params.push(quarter);
+      params.push(parseInt(quarter));
+    }
+    if (period_type) {
+      sql += ` AND period_type = $${idx++}::period_type`;
+      params.push(period_type);
+    }
+    if (transition_id) {
+      sql += ` AND transition_id = $${idx++}`;
+      params.push(transition_id);
+    }
+
+    // Apply manager role filtering ONLY if period_type and transition_id are NOT specified
+    // If period_type/transition_id are specified, we want to fetch that specific review regardless of manager role
+    // This allows checking submission status for both pre and post-transition reviews
+    if (!period_type && !transition_id && managerId && employee_id && cycle_id && quarter && employee_id !== managerId) {
+      const managerRole = await getManagerRoleForTransition(managerId, employee_id, cycle_id, parseInt(quarter));
+      
+      if (managerRole === 'old_manager') {
+        // Old manager: only pre-transition reviews
+        sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'pre_transition'::period_type)`;
+      } else if (managerRole === 'new_manager') {
+        // New manager: only post-transition reviews
+        sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'post_transition'::period_type)`;
+      } else if (managerRole === 'same_manager') {
+        // Same manager: both pre and post-transition (no additional filter needed)
+      }
+      // If managerRole is null, user is not involved in transition, show all data
     }
 
     sql += ' ORDER BY quarter ASC';
@@ -385,15 +524,140 @@ router.get('/quarterly-manager-reviews/count', authMiddleware, async (req, res) 
 // POST /api/evaluations/quarterly-manager-reviews (upsert)
 router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, status, calculated_overall_rating } = req.body;
+    const { employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, status, calculated_overall_rating, period_type, transition_id, period_start_date, period_end_date } = req.body;
+    
+    // Validate and parse quarter to integer
+    if (!quarter) {
+      return res.status(400).json({ error: 'quarter is required' });
+    }
+    const quarterNum = parseInt(quarter);
+    if (isNaN(quarterNum) || quarterNum < 1 || quarterNum > 4) {
+      return res.status(400).json({ error: 'quarter must be a number between 1 and 4' });
+    }
+    
+    // Check if review is already submitted for this period (prevent resubmission)
+    if (status === 'submitted' && employee_id && cycle_id) {
+      let existingReviewQuery = `
+        SELECT id, status, period_type, transition_id
+        FROM quarterly_manager_reviews
+        WHERE employee_id = $1 
+          AND cycle_id = $2 
+          AND quarter = $3
+      `;
+      const existingParams = [employee_id, cycle_id, quarterNum];
+      let paramIdx = 4;
+      
+      // For transition employees, check specific period
+      if (period_type && transition_id) {
+        existingReviewQuery += ` AND period_type = $${paramIdx}::period_type AND transition_id = $${paramIdx + 1}`;
+        existingParams.push(period_type, transition_id);
+      } else if (period_type) {
+        existingReviewQuery += ` AND period_type = $${paramIdx}::period_type`;
+        existingParams.push(period_type);
+      } else {
+        existingReviewQuery += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type)`;
+      }
+      
+      existingReviewQuery += ` AND status = 'submitted' LIMIT 1`;
+      
+      const existingReview = await query(existingReviewQuery, existingParams);
+      
+      if (existingReview.rows.length > 0) {
+        return res.status(400).json({ 
+          error: 'Review already submitted for this period',
+          message: 'This review has already been submitted. Please contact HR if you need to make changes.',
+          review_id: existingReview.rows[0].id
+        });
+      }
+    }
+    
+    // Auto-detect transition if not explicitly provided
+    let periodType = period_type || 'full_quarter';
+    let transitionId = transition_id || null;
+    let periodStartDate = period_start_date || null;
+    let periodEndDate = period_end_date || null;
+    
+    // If transition exists but period_type not provided, determine it based on current date
+    if (employee_id && cycle_id && !period_type && !transition_id) {
+      const transitionResult = await query(
+        `SELECT id, transition_date, old_manager_id, new_manager_id
+         FROM employee_quarter_transitions 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+        [employee_id, cycle_id, quarterNum]
+      );
+
+      if (transitionResult.rows.length > 0) {
+        const transition = transitionResult.rows[0];
+        transitionId = transition.id;
+        const transitionDate = new Date(transition.transition_date);
+        const now = new Date();
+        transitionDate.setHours(0, 0, 0, 0);
+        
+        // Get quarter date range from quarterly_cycles table
+        const quarterRange = await query(
+          `SELECT quarter_start_date, quarter_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarter]
+        );
+        
+        if (quarterRange.rows.length > 0) {
+          const quarterStart = new Date(quarterRange.rows[0].quarter_start_date);
+          const quarterEnd = new Date(quarterRange.rows[0].quarter_end_date);
+          
+          // Determine period based on reviewer - old manager reviews pre, new manager reviews post
+          if (reviewer_id && transition.old_manager_id && reviewer_id === transition.old_manager_id) {
+            periodType = 'pre_transition';
+            periodStartDate = quarterStart.toISOString().split('T')[0];
+            // For pre-transition end date, use the transition date itself (not transition date - 1)
+            // Format transition date directly to avoid timezone issues
+            periodEndDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+          } else if (reviewer_id && transition.new_manager_id && reviewer_id === transition.new_manager_id) {
+            periodType = 'post_transition';
+            // Format transition date directly to avoid timezone issues
+            periodStartDate = transition.transition_date instanceof Date 
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string' 
+                ? transition.transition_date.split('T')[0] 
+                : transitionDate.toISOString().split('T')[0]);
+            periodEndDate = quarterEnd.toISOString().split('T')[0];
+          } else if (now >= transitionDate) {
+            // Default: if after transition date, assume post-transition
+            periodType = 'post_transition';
+            // Format transition date directly to avoid timezone issues
+            periodStartDate = transition.transition_date instanceof Date 
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string' 
+                ? transition.transition_date.split('T')[0] 
+                : transitionDate.toISOString().split('T')[0]);
+            periodEndDate = quarterEnd.toISOString().split('T')[0];
+          } else {
+            // Default: if before transition date, assume pre-transition
+            periodType = 'pre_transition';
+            periodStartDate = quarterStart.toISOString().split('T')[0];
+            // For pre-transition end date, use the transition date itself (not transition date - 1)
+            // Format transition date directly to avoid timezone issues
+            periodEndDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+          }
+        }
+      }
+    }
     
     // Check if user is manager or delegate
-    if (employee_id && cycle_id && quarter) {
+    if (employee_id && cycle_id) {
       const auth = await checkManagerOrDelegate(
         req.user.userId,
         employee_id,
         cycle_id,
-        parseInt(quarter)
+        quarterNum
       );
       
       if (!auth.isAuthorized) {
@@ -401,35 +665,77 @@ router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
       }
     }
     
+    // Special handling for transition employees: Aggregation logic
+    // When New Manager submits post-transition review, aggregate with pre-transition rating
+    let finalCalculatedRating = calculated_overall_rating;
+    if (periodType === 'post_transition' && status === 'submitted' && transitionId && calculated_overall_rating) {
+      // Get pre-transition manager review rating
+      const preTransitionReview = await query(
+        `SELECT calculated_overall_rating 
+         FROM quarterly_manager_reviews 
+         WHERE employee_id = $1 
+           AND cycle_id = $2 
+           AND quarter = $3 
+           AND period_type = 'pre_transition'::period_type
+           AND transition_id = $4
+           AND status = 'submitted'
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [employee_id, cycle_id, quarterNum, transitionId]
+      );
+
+      if (preTransitionReview.rows.length > 0 && preTransitionReview.rows[0].calculated_overall_rating) {
+        const preRating = parseFloat(preTransitionReview.rows[0].calculated_overall_rating);
+        const postRating = parseFloat(calculated_overall_rating);
+        
+        // Aggregate: overall_rating = (old_manager_overall_rating + new_manager_overall_rating) / 2
+        finalCalculatedRating = ((preRating + postRating) / 2).toFixed(2);
+        
+        console.log(`[Transition Aggregation] Employee ${employee_id}, Quarter ${quarterNum}: Pre=${preRating}, Post=${postRating}, Aggregated=${finalCalculatedRating}`);
+      }
+    }
+
     // Upsert quarterly manager review
+    // Use the unique constraint that includes period_type and transition_id
+    // The constraint is: (employee_id, cycle_id, quarter, period_type, COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))
     const result = await query(
-      `INSERT INTO quarterly_manager_reviews (id, employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, calculated_overall_rating, status, approved_at, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
+      `INSERT INTO quarterly_manager_reviews (
+        id, employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, 
+        calculated_overall_rating, status, period_type, transition_id, period_start_date, period_end_date,
+        approved_at, created_at, updated_at
+      )
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9::period_type, $10, $11, $12, $13, NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter, period_type, (COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET
          overall_comments = EXCLUDED.overall_comments,
          guidance = EXCLUDED.guidance,
          calculated_overall_rating = EXCLUDED.calculated_overall_rating,
          status = EXCLUDED.status,
+         period_start_date = COALESCE(EXCLUDED.period_start_date, quarterly_manager_reviews.period_start_date),
+         period_end_date = COALESCE(EXCLUDED.period_end_date, quarterly_manager_reviews.period_end_date),
          approved_at = CASE WHEN EXCLUDED.status = 'submitted' THEN NOW() ELSE quarterly_manager_reviews.approved_at END,
          updated_at = NOW()
        RETURNING *`,
       [
         employee_id ?? null,
         cycle_id ?? null,
-        quarter ?? null,
+        quarterNum, // Use parsed integer, not raw quarter
         reviewer_id ?? null,
         overall_comments ?? null,
         guidance ?? null,
-        calculated_overall_rating ?? null,
+        finalCalculatedRating ?? null,
         status || 'pending',
+        periodType,
+        transitionId,
+        periodStartDate,
+        periodEndDate,
         status === 'submitted' ? new Date() : null
       ]
     );
 
     // Also upsert into manager_evaluations table with quarterly rating
-    if (employee_id && cycle_id && reviewer_id && quarter) {
-      const quarterNum = parseInt(quarter);
-      const quarterRating = calculated_overall_rating ?? null;
+    if (employee_id && cycle_id && reviewer_id) {
+      // Use aggregated rating if it was calculated
+      const quarterRating = finalCalculatedRating ?? calculated_overall_rating ?? null;
       
       // Build dynamic column name for the quarter rating
       const quarterColumn = `q${quarterNum}_rating`;
@@ -500,7 +806,23 @@ router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
       }
     }
 
-    res.json({ data: result.rows[0] });
+    // Return response with transition info for frontend date validation bypass
+    const responseData = result.rows[0];
+    if (transitionId) {
+      // Check if we're within quarter dates (required constraint for transition actions)
+      const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
+      if (canPerform) {
+        responseData.has_active_transition = true;
+        responseData.date_validation_bypassed = true; // Frontend can use this to bypass date checks
+      } else {
+        // Transition exists but we're outside quarter dates - don't allow
+        return res.status(400).json({ 
+          error: 'Actions for employees with transitions are only allowed within the current quarter dates' 
+        });
+      }
+    }
+    
+    res.json({ data: responseData });
   } catch (error) {
     console.error('Quarterly manager review upsert error:', error);
     res.status(500).json({ error: error.message });
@@ -829,39 +1151,52 @@ router.post('/hr/send-to-manager', authMiddleware, requireRole(['hr_admin', 'hrb
       return res.status(400).json({ error: 'quarter and cycleId are required' });
     }
     
-    // Verify that calibrated_rating exists for all employees before sending
-    // Use IN clause with proper array handling for Sequelize
-    const placeholders = employeeIds.map((_, i) => `?`).join(',');
-    const checkQuery = `
-      SELECT employee_id, calibrated_rating
-      FROM normalized_ratings
-      WHERE employee_id IN (${placeholders})
-        AND quarter = ?
-        AND performance_cycle_id = ?
-        AND status IN ('DRAFT', 'REJECTED')
-    `;
-    const checkResult = await query(checkQuery, [...employeeIds, parseInt(quarter), cycleId]);
+    // Check if calibration is enabled - only require calibrated_rating if enabled
+    const calibrationEnabled = await isCalibrationEnabled();
     
-    const missingCalibration = checkResult.rows.filter(r => r.calibrated_rating === null || r.calibrated_rating === undefined);
-    if (missingCalibration.length > 0) {
-      return res.status(400).json({ 
-        error: 'Calibration required before sending to manager',
-        details: `${missingCalibration.length} employees do not have calibrated_rating. Please run calibration first.`
-      });
+    // Verify that calibrated_rating exists for all employees before sending (only if calibration is enabled)
+    if (calibrationEnabled) {
+      // Use IN clause with proper array handling for Sequelize
+      const checkPlaceholders = employeeIds.map((_, i) => `?`).join(',');
+      const checkResult = await query(
+        `SELECT employee_id, calibrated_rating
+         FROM normalized_ratings
+         WHERE employee_id IN (${checkPlaceholders})
+           AND quarter = ?
+           AND performance_cycle_id = ?
+           AND status IN ('DRAFT', 'REJECTED')`,
+        [...employeeIds, parseInt(quarter), cycleId]
+      );
+      
+      const missingCalibration = checkResult.rows.filter(r => r.calibrated_rating === null || r.calibrated_rating === undefined);
+      if (missingCalibration.length > 0) {
+        return res.status(400).json({ 
+          error: 'Calibration required before sending to manager',
+          details: `${missingCalibration.length} employees do not have calibrated_rating. Please run calibration first.`,
+          uncalibrated: missingCalibration.map(r => r.employee_id)
+        });
+      }
     }
     
+    // Update status to SENT_TO_MANAGER
     // Use IN clause with proper array handling for Sequelize
     const updatePlaceholders = employeeIds.map((_, i) => `?`).join(',');
+    // Only require calibrated_rating in WHERE clause if calibration is enabled
+    const whereClause = calibrationEnabled 
+      ? `AND status IN ('DRAFT', 'REJECTED') AND calibrated_rating IS NOT NULL`
+      : `AND status IN ('DRAFT', 'REJECTED')`;
+    
     const result = await query(
       `UPDATE normalized_ratings 
        SET status = 'SENT_TO_MANAGER', updated_at = NOW()
-       WHERE employee_id IN (${updatePlaceholders}) 
-         AND quarter = ? 
+       WHERE employee_id IN (${updatePlaceholders})
+         AND quarter = ?
          AND performance_cycle_id = ?
-         AND status IN ('DRAFT', 'REJECTED')
-         AND calibrated_rating IS NOT NULL`,
+         ${whereClause}`,
       [...employeeIds, parseInt(quarter), cycleId]
     );
+    
+    console.log(`[Send to Manager] Sent ${result.rowCount} ratings to managers (excluding pre-transition reviews)`);
     
     res.json({ data: [], count: result.rowCount });
   } catch (error) {
@@ -872,9 +1207,10 @@ router.post('/hr/send-to-manager', authMiddleware, requireRole(['hr_admin', 'hrb
 
 // POST /api/evaluations/manager/review
 // Manager accepts or rejects normalized ratings
+// For transition employees: Must filter by period_type and transition_id
 router.post('/manager/review', authMiddleware, async (req, res) => {
   try {
-    const { employeeId, quarter, cycleId, action } = req.body;
+    const { employeeId, quarter, cycleId, action, periodType, transitionId } = req.body;
     
     if (!employeeId || !quarter || !cycleId || !action) {
       return res.status(400).json({ error: 'employeeId, quarter, cycleId, and action are required' });
@@ -885,6 +1221,7 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
     
     const newStatus = action === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED';
     
+    // Update normalized_ratings status
     const result = await query(
       `UPDATE normalized_ratings 
        SET status = $1, updated_at = NOW()
@@ -896,9 +1233,13 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
     );
     
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'No rating found or already processed' });
+      return res.status(404).json({ 
+        error: 'No rating found or already processed',
+        hint: 'Make sure the rating status is SENT_TO_MANAGER'
+      });
     }
     
+    console.log(`[Manager Review] Employee ${employeeId}, Quarter ${quarter}: ${action}ED`);
     res.json({ data: { employeeId, status: newStatus } });
   } catch (error) {
     console.error('Error in manager review:', error);
@@ -920,27 +1261,32 @@ router.post('/hr/publish', authMiddleware, requireRole(['hr_admin', 'hrbp', 'sys
       return res.status(400).json({ error: 'quarter and cycleId are required' });
     }
     
-    // Verify all have calibrated_rating before publishing
-    // Use IN clause with proper array handling for Sequelize
-    const checkPlaceholders = employeeIds.map((_, i) => `?`).join(',');
-    const checkQuery = await query(
-      `SELECT employee_id, calibrated_rating, status
-       FROM normalized_ratings
-       WHERE employee_id IN (${checkPlaceholders})
-         AND quarter = ?
-         AND performance_cycle_id = ?`,
-      [...employeeIds, parseInt(quarter), cycleId]
-    );
+    // Check if calibration is enabled - only require calibrated_rating if enabled
+    const calibrationEnabled = await isCalibrationEnabled();
     
-    const missingCalibration = checkQuery.rows.filter(r => 
-      r.status === 'ACCEPTED' && (r.calibrated_rating === null || r.calibrated_rating === undefined)
-    );
-    
-    if (missingCalibration.length > 0) {
-      return res.status(400).json({ 
-        error: 'Cannot publish without calibrated_rating',
-        details: `${missingCalibration.length} employees do not have calibrated_rating. Please run calibration first.`
-      });
+    // Verify all have calibrated_rating before publishing (only if calibration is enabled)
+    if (calibrationEnabled) {
+      // Use IN clause with proper array handling for Sequelize
+      const checkPlaceholders = employeeIds.map((_, i) => `?`).join(',');
+      const checkQuery = await query(
+        `SELECT employee_id, calibrated_rating, status
+         FROM normalized_ratings
+         WHERE employee_id IN (${checkPlaceholders})
+           AND quarter = ?
+           AND performance_cycle_id = ?`,
+        [...employeeIds, parseInt(quarter), cycleId]
+      );
+      
+      const missingCalibration = checkQuery.rows.filter(r => 
+        r.status === 'ACCEPTED' && (r.calibrated_rating === null || r.calibrated_rating === undefined)
+      );
+      
+      if (missingCalibration.length > 0) {
+        return res.status(400).json({ 
+          error: 'Cannot publish without calibrated_rating',
+          details: `${missingCalibration.length} employees do not have calibrated_rating. Please run calibration first.`
+        });
+      }
     }
     
     // Get HR user ID (profile_id) from authenticated user
@@ -953,14 +1299,18 @@ router.post('/hr/publish', authMiddleware, requireRole(['hr_admin', 'hrbp', 'sys
     const publishPlaceholders = employeeIds.map((_, i) => `?`).join(',');
     
     // Update normalized_ratings to PUBLISHED
+    // Only require calibrated_rating in WHERE clause if calibration is enabled
+    const whereClause = calibrationEnabled
+      ? `AND status = 'ACCEPTED' AND calibrated_rating IS NOT NULL`
+      : `AND status = 'ACCEPTED'`;
+    
     const result = await query(
       `UPDATE normalized_ratings 
        SET status = 'PUBLISHED', updated_at = NOW()
        WHERE employee_id IN (${publishPlaceholders}) 
          AND quarter = ? 
          AND performance_cycle_id = ?
-         AND status = 'ACCEPTED'
-         AND calibrated_rating IS NOT NULL`,
+         ${whereClause}`,
       [...employeeIds, parseInt(quarter), cycleId]
     );
 
@@ -988,15 +1338,16 @@ router.post('/hr/publish', authMiddleware, requireRole(['hr_admin', 'hrbp', 'sys
 });
 
 // PUT /api/evaluations/hr/normalized-rating/:id
-// Update normalized rating (for rejected ratings)
-// When updated, calibrated_rating is cleared and status reset to DRAFT (recalibration needed)
+// Update normalized rating and/or calibrated rating (for rejected ratings)
+// HR can edit both final_normalized_rating and calibrated_rating independently
 router.put('/hr/normalized-rating/:id', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
   try {
     const { id } = req.params;
-    const { final_normalized_rating } = req.body;
+    const { final_normalized_rating, calibrated_rating } = req.body;
     
-    if (final_normalized_rating === undefined || final_normalized_rating === null) {
-      return res.status(400).json({ error: 'final_normalized_rating is required' });
+    // At least one field must be provided
+    if (final_normalized_rating === undefined && calibrated_rating === undefined) {
+      return res.status(400).json({ error: 'At least one of final_normalized_rating or calibrated_rating must be provided' });
     }
     
     // Check if record is PUBLISHED (immutable)
@@ -1013,27 +1364,59 @@ router.put('/hr/normalized-rating/:id', authMiddleware, requireRole(['hr_admin',
       return res.status(403).json({ error: 'Cannot update PUBLISHED ratings. They are immutable.' });
     }
     
-    const result = await query(
-      `UPDATE normalized_ratings 
-       SET final_normalized_rating = $1, 
-           calibrated_rating = NULL,
-           status = 'DRAFT',
-           updated_at = NOW()
-       WHERE id = $2 
-         AND status IN ('REJECTED', 'DRAFT', 'SENT_TO_MANAGER')
-         AND status != 'PUBLISHED'`,
-      [parseFloat(final_normalized_rating), id]
-    );
+    // Build dynamic UPDATE query based on what's provided
+    const updateFields = [];
+    const updateParams = [];
+    let paramIndex = 1;
+    
+    if (final_normalized_rating !== undefined) {
+      updateFields.push(`final_normalized_rating = $${paramIndex++}`);
+      updateParams.push(parseFloat(final_normalized_rating));
+    }
+    
+    if (calibrated_rating !== undefined) {
+      updateFields.push(`calibrated_rating = $${paramIndex++}`);
+      updateParams.push(calibrated_rating === null ? null : parseFloat(calibrated_rating));
+    }
+    
+    // Always update status to DRAFT and updated_at
+    updateFields.push(`status = 'DRAFT'`);
+    updateFields.push(`updated_at = NOW()`);
+    
+    // Add id as last parameter for WHERE clause
+    updateParams.push(id);
+    
+    const updateQuery = `
+      UPDATE normalized_ratings 
+      SET ${updateFields.join(', ')}
+      WHERE id = $${paramIndex}
+        AND status IN ('REJECTED', 'DRAFT', 'SENT_TO_MANAGER')
+        AND status != 'PUBLISHED'
+      RETURNING id, final_normalized_rating, calibrated_rating
+    `;
+    
+    const result = await query(updateQuery, updateParams);
     
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Rating not found or cannot be updated' });
     }
     
+    const updatedData = result.rows[0];
+    const messages = [];
+    
+    if (final_normalized_rating !== undefined) {
+      messages.push('Normalized rating updated');
+    }
+    if (calibrated_rating !== undefined) {
+      messages.push('Calibrated rating updated');
+    }
+    
     res.json({ 
       data: { 
-        id, 
-        final_normalized_rating,
-        message: 'Rating updated. Calibration cleared. Please run calibration again before sending to manager.'
+        id: updatedData.id, 
+        final_normalized_rating: updatedData.final_normalized_rating,
+        calibrated_rating: updatedData.calibrated_rating,
+        message: messages.join('. ') + '.'
       } 
     });
   } catch (error) {
@@ -1055,7 +1438,7 @@ router.get('/manager/normalized-ratings', authMiddleware, async (req, res) => {
     
     // Get manager's emp_code
     const managerResult = await query(
-      `SELECT emp_code FROM employees WHERE id = ?`,
+      `SELECT emp_code FROM employees WHERE id = $1`,
       [manager_id]
     );
     
@@ -1078,12 +1461,22 @@ router.get('/manager/normalized-ratings', authMiddleware, async (req, res) => {
         e.grade
       FROM normalized_ratings nr
       JOIN employees e ON e.id = nr.employee_id
-      WHERE nr.performance_cycle_id = ? 
-        AND nr.quarter = ?
-        AND e.manager_code = ?
+      WHERE nr.performance_cycle_id = $1 
+        AND nr.quarter = $2
         AND nr.status = 'SENT_TO_MANAGER'
+        AND (
+          e.manager_code = $3
+          OR EXISTS (
+            SELECT 1 FROM employee_quarter_transitions eqt
+            WHERE eqt.employee_id = e.id
+              AND eqt.new_manager_id = $4
+              AND eqt.cycle_id = nr.performance_cycle_id
+              AND eqt.quarter = nr.quarter
+              AND eqt.transition_date <= CURRENT_DATE
+          )
+        )
       ORDER BY e.emp_code`,
-      [cycle_id, parseInt(quarter), managerEmpCode]
+      [cycle_id, parseInt(quarter), managerEmpCode, manager_id]
     );
     
     res.json({ data: result.rows });
@@ -1096,9 +1489,10 @@ router.get('/manager/normalized-ratings', authMiddleware, async (req, res) => {
 // GET /api/evaluations/employee/normalized-rating
 // Get published calibrated rating for an employee (for My Rating page)
 // Employees see only calibrated_rating after HR publishes
+// Supports period_type and transition_id for transition-specific ratings
 router.get('/employee/normalized-rating', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, quarter, cycle_id } = req.query;
+    const { employee_id, quarter, cycle_id, period_type, transition_id } = req.query;
     
     if (!employee_id || !quarter || !cycle_id) {
       return res.status(400).json({ error: 'employee_id, quarter, and cycle_id are required' });
@@ -1120,6 +1514,7 @@ router.get('/employee/normalized-rating', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Access denied. You can only view your own ratings.' });
     }
     
+    // Get published calibrated rating
     const result = await query(
       `SELECT 
         calibrated_rating,
@@ -1632,6 +2027,170 @@ router.get('/rating-rejections', authMiddleware, async (req, res) => {
   }
 });
 
+// POST /api/evaluations/hr-approve-review
+// HR approves a manager review and releases it to employee
+// Special handling: Pre-transition reviews are approved directly (no normalization)
+// Post-transition aggregated reviews go through normalization workflow
+router.post('/hr-approve-review', authMiddleware, async (req, res) => {
+  try {
+    const { manager_review_id } = req.body;
+    const userId = req.user?.userId;
+
+    if (!manager_review_id) {
+      return res.status(400).json({ error: 'manager_review_id is required' });
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    // First, get the review to check if it's a pre-transition review
+    const reviewCheck = await query(
+      `SELECT period_type, transition_id, status 
+       FROM quarterly_manager_reviews 
+       WHERE id = $1`,
+      [manager_review_id]
+    );
+
+    if (reviewCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Review not found' });
+    }
+
+    const review = reviewCheck.rows[0];
+
+    // Pre-transition reviews: Approve directly (no normalization/calibration)
+    if (review.period_type === 'pre_transition' && review.transition_id) {
+      const result = await query(
+        `UPDATE quarterly_manager_reviews 
+         SET hr_approved_at = NOW(),
+             hr_approved_by = $1,
+             released_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $2 AND status = 'submitted' AND hr_approved_at IS NULL
+         RETURNING *`,
+        [userId, manager_review_id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Review not found or already approved' });
+      }
+
+      console.log(`[HR Approve] Pre-transition review ${manager_review_id} approved directly (no normalization)`);
+      return res.json({ 
+        data: result.rows[0],
+        message: 'Pre-transition review approved. No normalization required.',
+        requires_normalization: false
+      });
+    }
+
+    // Post-transition aggregated reviews: Should go through normalization first
+    // But if HR wants to approve directly, allow it (for edge cases)
+    if (review.period_type === 'post_transition' && review.transition_id) {
+      // Check if normalization has been done
+      const normalizedCheck = await query(
+        `SELECT id, status, final_normalized_rating 
+         FROM normalized_ratings 
+         WHERE employee_id = (
+           SELECT employee_id FROM quarterly_manager_reviews WHERE id = $1
+         )
+         AND quarter = (SELECT quarter FROM quarterly_manager_reviews WHERE id = $1)
+         AND performance_cycle_id = (SELECT cycle_id FROM quarterly_manager_reviews WHERE id = $1)
+         AND status IN ('DRAFT', 'SENT_TO_MANAGER', 'ACCEPTED', 'PUBLISHED')`,
+        [manager_review_id]
+      );
+
+      if (normalizedCheck.rows.length === 0) {
+        // No normalization yet - approve directly but warn HR
+        const result = await query(
+          `UPDATE quarterly_manager_reviews 
+           SET hr_approved_at = NOW(),
+               hr_approved_by = $1,
+               released_at = NOW(),
+               updated_at = NOW()
+           WHERE id = $2 AND status = 'submitted' AND hr_approved_at IS NULL
+           RETURNING *`,
+          [userId, manager_review_id]
+        );
+
+        if (result.rows.length === 0) {
+          return res.status(404).json({ error: 'Review not found or already approved' });
+        }
+
+        console.log(`[HR Approve] Post-transition review ${manager_review_id} approved without normalization (edge case)`);
+        return res.json({ 
+          data: result.rows[0],
+          message: 'Post-transition review approved. Consider normalizing before final approval.',
+          requires_normalization: true,
+          warning: 'Normalization recommended for post-transition reviews'
+        });
+      }
+    }
+
+    // Standard approval for non-transition or full-quarter reviews
+    const result = await query(
+      `UPDATE quarterly_manager_reviews 
+       SET hr_approved_at = NOW(),
+           hr_approved_by = $1,
+           released_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $2 AND status = 'submitted' AND hr_approved_at IS NULL
+       RETURNING *`,
+      [userId, manager_review_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Review not found or already approved' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('HR approve review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/hr-reject-review
+// HR rejects a manager review (sends back to manager)
+router.post('/hr-reject-review', authMiddleware, async (req, res) => {
+  try {
+    const { manager_review_id, rejection_reason } = req.body;
+
+    if (!manager_review_id || !rejection_reason) {
+      return res.status(400).json({ error: 'manager_review_id and rejection_reason are required' });
+    }
+
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(manager_review_id)) {
+      return res.status(400).json({ error: 'Invalid manager_review_id format. Expected UUID.' });
+    }
+
+    // Update status back to pending for manager to revise and store rejection reason
+    const result = await query(
+      `UPDATE quarterly_manager_reviews 
+       SET status = 'pending',
+           hr_rejection_reason = $2,
+           hr_approved_at = NULL,
+           hr_approved_by = NULL,
+           released_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted'
+       RETURNING *`,
+      [manager_review_id, rejection_reason]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Review not found or already processed' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('HR reject review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 // ========== YEAR-END HR REVIEW WORKFLOW ==========
 
 // GET /api/evaluations/hr-pending-year-end-reviews
@@ -1793,6 +2352,61 @@ router.post('/hr-approve-year-end-review', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('HR approve year-end review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== PERIOD RATINGS ==========
+
+// GET /api/evaluations/period-ratings - Get period ratings for an employee
+router.get('/period-ratings', authMiddleware, async (req, res) => {
+  try {
+    const { employee_id, cycle_id, quarter, period_type } = req.query;
+    
+    if (!employee_id || !cycle_id) {
+      return res.status(400).json({ error: 'employee_id and cycle_id are required' });
+    }
+    
+    let sql = `
+      SELECT 
+        id,
+        employee_id,
+        cycle_id,
+        quarter,
+        transition_id,
+        period_type,
+        period_start_date,
+        period_end_date,
+        period_days,
+        weighted_avg_rating,
+        manager_id,
+        is_final,
+        created_at,
+        updated_at
+      FROM quarterly_period_ratings
+      WHERE employee_id = $1 AND cycle_id = $2
+    `;
+    
+    const params = [employee_id, cycle_id];
+    let paramIndex = 3;
+    
+    if (quarter) {
+      sql += ` AND quarter = $${paramIndex++}`;
+      params.push(parseInt(quarter));
+    }
+    
+    if (period_type) {
+      sql += ` AND period_type = $${paramIndex++}::period_type`;
+      params.push(period_type);
+    }
+    
+    sql += ` ORDER BY quarter, period_type`;
+    
+    const result = await query(sql, params);
+    
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get period ratings error:', error);
     res.status(500).json({ error: error.message });
   }
 });

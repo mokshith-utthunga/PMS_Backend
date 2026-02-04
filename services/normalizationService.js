@@ -1,18 +1,6 @@
 import { query } from '../config/database.js';
 
-/**
- * GOAL-LEVEL NORMALIZATION SERVICE
- * 
- * This service normalizes ratings ONLY at the Goal/Overall level.
- * KPI and KRA ratings remain unchanged (raw) for auditability.
- * 
- * Process:
- * 1. Fetch Goal Raw Ratings (calculated_overall_rating from quarterly_manager_reviews)
- * 2. Group employees by manager and by grade
- * 3. Normalize goal ratings within each group using Box-Cox (lambda=0.5) + Min-Max
- * 4. Combine manager and grade normalized ratings (50/50)
- * 5. Store raw KPI/KRA ratings for audit (not normalized)
- */
+
 
 const DEFAULT_CONFIG = {
   minGroupSize: 3,              // Minimum group size for normalization (skip if < 3)
@@ -139,12 +127,16 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
   
   try {
     // Step 1: Fetch all submitted manager reviews with goal raw ratings
+    // IMPORTANT: Skip pre_transition reviews - they are approved directly by HR without normalization
+    // Only normalize: full_quarter reviews and post_transition aggregated reviews
     const reviewsQuery = `
       SELECT 
         qmr.id,
         qmr.employee_id,
         qmr.reviewer_id as manager_id,
         qmr.calculated_overall_rating as raw_rating,
+        qmr.period_type,
+        qmr.transition_id,
         e.grade
       FROM quarterly_manager_reviews qmr
       JOIN employees e ON e.id = qmr.employee_id
@@ -153,28 +145,39 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
         AND qmr.status = 'submitted'
         AND qmr.calculated_overall_rating IS NOT NULL
         AND qmr.calculated_overall_rating > 0
-        AND (qmr.period_type = 'full_quarter'::period_type OR qmr.period_type IS NULL)
+        AND qmr.period_type != 'pre_transition'::period_type  -- Skip pre-transition reviews
     `;
     
     const reviewsResult = await query(reviewsQuery, [cycleId, quarter]);
     const reviews = reviewsResult.rows;
     
-    console.log(`Found ${reviews.length} submitted manager reviews for quarter ${quarter}, cycle ${cycleId}`);
+    console.log(`Found ${reviews.length} submitted manager reviews for quarter ${quarter}, cycle ${cycleId} (pre-transition reviews excluded)`);
     
     if (reviews.length === 0) {
-      return { processed: 0, skipped: 0, message: 'No submitted ratings found for this quarter', runId: null };
+      return { processed: 0, skipped: 0, message: 'No submitted ratings found for this quarter (excluding pre-transition reviews)', runId: null };
     }
+    
+    // Separate reviews by period type for transition handling
+    const fullQuarterReviews = reviews.filter(r => !r.period_type || r.period_type === 'full_quarter');
+    const postTransitionReviews = reviews.filter(r => r.period_type === 'post_transition');
+    
+    // Note: preTransitionReviews are excluded from normalization (approved directly by HR)
+    // They are filtered out in the SQL query above (line 148)
+    
+    console.log(`Reviews breakdown: ${fullQuarterReviews.length} full_quarter, 0 pre_transition (excluded), ${postTransitionReviews.length} post_transition`);
     
     // Step 2: Fetch raw KPI and KRA ratings for audit (NOT normalized)
     const employeeIds = reviews.map(r => r.employee_id);
     
-    // Fetch KPI ratings (for audit storage)
+    // Fetch KPI ratings (for audit storage) - include all period types
     const kpiRatingsQuery = `
       SELECT 
         gmr.goal_id,
         gmr.rating,
         gmr.manager_review_id,
         qmr.employee_id,
+        qmr.period_type,
+        qmr.transition_id,
         g.kra_id,
         g.weight as kpi_weight
       FROM quarterly_kpi_manager_feedback gmr
@@ -185,28 +188,25 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
         AND qmr.status = 'submitted'
         AND gmr.rating IS NOT NULL
         AND gmr.rating > 0
-        AND (qmr.period_type = 'full_quarter'::period_type OR qmr.period_type IS NULL)
     `;
     
     const kpiRatingsResult = await query(kpiRatingsQuery, [cycleId, quarter]);
     const kpiRatings = kpiRatingsResult.rows;
     
-    // Fetch KRAs and KPIs structure for calculating raw KRA ratings
+    // Fetch KRAs and KPIs structure for calculating raw KRA ratings - include all period types
     const krasQuery = `
-      SELECT id, weight, employee_id
+      SELECT id, weight, employee_id, period_type, transition_id
       FROM kras
       WHERE cycle_id = $1
-        AND (period_type = 'full_quarter'::period_type OR period_type IS NULL)
     `;
     
     const krasResult = await query(krasQuery, [cycleId]);
     const allKras = krasResult.rows;
     
     const kpisQuery = `
-      SELECT id, kra_id, weight, employee_id
+      SELECT id, kra_id, weight, employee_id, period_type, transition_id
       FROM goals
       WHERE cycle_id = $1 AND kra_id IS NOT NULL
-        AND (period_type = 'full_quarter'::period_type OR period_type IS NULL)
     `;
     
     const kpisResult = await query(kpisQuery, [cycleId]);
@@ -263,32 +263,47 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
     }
     
     // Step 3: Group employees by manager and by grade
-    const managerGroups = new Map(); // managerId -> [{employeeId, rawRating, grade}]
-    const gradeGroups = new Map();   // grade -> [{employeeId, rawRating, managerId}]
+    // For transitions: pre-transition uses raw rating, post-transition gets normalized
+    const managerGroups = new Map(); // managerId -> [{employeeId, rawRating, grade, periodType, transitionId}]
+    const gradeGroups = new Map();   // grade -> [{employeeId, rawRating, managerId, periodType, transitionId}]
     
     reviewsToProcess.forEach(review => {
       const managerId = review.manager_id;
       const grade = review.grade || 'UNKNOWN';
       const rawRating = parseFloat(review.raw_rating);
+      const periodType = review.period_type || 'full_quarter';
+      const transitionId = review.transition_id || null;
       
-      // Group by manager
+      // For pre-transition periods: skip normalization (use raw rating)
+      // Only normalize full_quarter and post_transition periods
+      if (periodType === 'pre_transition') {
+        // Pre-transition ratings are not normalized - they use raw rating
+        // We'll handle this in the final calculation step
+        return;
+      }
+      
+      // Group by manager (for normalization)
       if (!managerGroups.has(managerId)) {
         managerGroups.set(managerId, []);
       }
       managerGroups.get(managerId).push({
         employeeId: review.employee_id,
         rawRating,
-        grade
+        grade,
+        periodType,
+        transitionId
       });
       
-      // Group by grade
+      // Group by grade (for normalization)
       if (!gradeGroups.has(grade)) {
         gradeGroups.set(grade, []);
       }
       gradeGroups.get(grade).push({
         employeeId: review.employee_id,
         rawRating,
-        managerId
+        managerId,
+        periodType,
+        transitionId
       });
     });
     
@@ -339,35 +354,111 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
     }
     
     // Step 6: Combine manager and grade normalized ratings
+    // For transitions: pre-transition uses raw, post-transition uses normalized, then average
     const normalizedResults = [];
     
-    for (const review of reviewsToProcess) {
+    // Group reviews by employee to handle transitions
+    const reviewsByEmployee = new Map();
+    reviewsToProcess.forEach(review => {
       const employeeId = review.employee_id;
-      const rawOverallRating = parseFloat(review.raw_rating);
+      if (!reviewsByEmployee.has(employeeId)) {
+        reviewsByEmployee.set(employeeId, []);
+      }
+      reviewsByEmployee.get(employeeId).push(review);
+    });
+    
+    for (const [employeeId, employeeReviews] of reviewsByEmployee) {
+      // Check if employee has transition (post-transition reviews only, pre-transition excluded from query)
+      const postReview = employeeReviews.find(r => r.period_type === 'post_transition');
+      const fullQuarterReview = employeeReviews.find(r => !r.period_type || r.period_type === 'full_quarter');
       
-      const managerNormalized = managerNormalizedRatings.get(employeeId);
-      const gradeNormalized = gradeNormalizedRatings.get(employeeId);
-      
-      // Combine manager and grade normalized ratings
       let finalRating = null;
-      if (managerNormalized !== undefined && gradeNormalized !== undefined) {
-        finalRating = finalConfig.managerWeight * managerNormalized + 
-                     finalConfig.gradeWeight * gradeNormalized;
-      } else if (managerNormalized !== undefined) {
-        finalRating = managerNormalized;
-      } else if (gradeNormalized !== undefined) {
-        finalRating = gradeNormalized;
+      let rawOverallRating = null;
+      let periodType = null;
+      let transitionId = null;
+      
+      if (postReview) {
+        // Employee has transition - post-transition review already contains aggregated rating
+        // The aggregation (pre + post) / 2 was done when New Manager submitted the review
+        // We only need to normalize the aggregated post-transition rating
+        const aggregatedRating = parseFloat(postReview.raw_rating); // This is already (pre + post) / 2
+        
+        // Get normalized rating for the aggregated post-transition review
+        const postManagerNormalized = managerNormalizedRatings.get(employeeId);
+        const postGradeNormalized = gradeNormalizedRatings.get(employeeId);
+        
+        if (postManagerNormalized !== undefined && postGradeNormalized !== undefined) {
+          finalRating = finalConfig.managerWeight * postManagerNormalized + 
+                       finalConfig.gradeWeight * postGradeNormalized;
+        } else if (postManagerNormalized !== undefined) {
+          finalRating = postManagerNormalized;
+        } else if (postGradeNormalized !== undefined) {
+          finalRating = postGradeNormalized;
+        } else {
+          finalRating = aggregatedRating; // Fallback to aggregated raw rating
+        }
+        
+        // Store the aggregated raw rating for audit
+        rawOverallRating = aggregatedRating;
+        periodType = 'post_transition'; // Store as post_transition for the normalized_ratings record
+        transitionId = postReview.transition_id;
+        
+        console.log(`[Normalization] Transition employee ${employeeId}: Aggregated rating ${aggregatedRating} normalized to ${finalRating}`);
+      } else if (fullQuarterReview) {
+        // Standard full quarter review
+        rawOverallRating = parseFloat(fullQuarterReview.raw_rating);
+        const managerNormalized = managerNormalizedRatings.get(employeeId);
+        const gradeNormalized = gradeNormalizedRatings.get(employeeId);
+        
+        if (managerNormalized !== undefined && gradeNormalized !== undefined) {
+          finalRating = finalConfig.managerWeight * managerNormalized + 
+                       finalConfig.gradeWeight * gradeNormalized;
+        } else if (managerNormalized !== undefined) {
+          finalRating = managerNormalized;
+        } else if (gradeNormalized !== undefined) {
+          finalRating = gradeNormalized;
+        } else {
+          finalRating = rawOverallRating; // Fallback to raw
+        }
+        periodType = 'full_quarter';
+      } else if (postReview) {
+        // Only post-transition review (pre-transition excluded from normalization)
+        // Post-transition review already contains aggregated rating from manager submission
+        const aggregatedRating = parseFloat(postReview.raw_rating);
+        const managerNormalized = managerNormalizedRatings.get(employeeId);
+        const gradeNormalized = gradeNormalizedRatings.get(employeeId);
+        
+        if (managerNormalized !== undefined && gradeNormalized !== undefined) {
+          finalRating = finalConfig.managerWeight * managerNormalized + 
+                       finalConfig.gradeWeight * gradeNormalized;
+        } else if (managerNormalized !== undefined) {
+          finalRating = managerNormalized;
+        } else if (gradeNormalized !== undefined) {
+          finalRating = gradeNormalized;
+        } else {
+          finalRating = aggregatedRating; // Fallback to aggregated raw rating
+        }
+        rawOverallRating = aggregatedRating;
+        periodType = 'post_transition';
+        transitionId = postReview.transition_id;
+        console.log(`[Normalization] Transition employee ${employeeId}: Aggregated rating ${aggregatedRating} normalized to ${finalRating}`);
       } else {
-        finalRating = rawOverallRating; // Fallback to raw
+        // Fallback - shouldn't happen
+        continue;
       }
       
+      // Use the first review for employee details
+      const review = employeeReviews[0];
+      
       // Prepare raw KPI ratings array for storage (for audit)
+      // Include KPIs from both periods if transition exists
       const employeeKpiRatingsArray = kpiRatings
         .filter(k => String(k.employee_id || '').trim() === String(employeeId || '').trim())
         .map(k => ({
           goal_id: k.goal_id,
           rating: parseFloat(k.rating),
-          weight: parseFloat(k.kpi_weight || 0)
+          weight: parseFloat(k.kpi_weight || 0),
+          period_type: k.period_type || 'full_quarter'
         }));
       
       // Prepare raw KRA ratings array for storage (for audit)
@@ -376,15 +467,22 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
       const employeeKraRatingsArray = employeeKras.map(kra => ({
         kra_id: kra.id,
         rating: rawKrasForEmployee[kra.id] ?? null,
-        weight: parseFloat(kra.weight || 0)
+        weight: parseFloat(kra.weight || 0),
+        period_type: kra.period_type || 'full_quarter'
       }));
+      
+      // Get manager ID - use post-transition manager if available, otherwise use review manager
+      let managerId = review.manager_id;
+      if (postReview) {
+        managerId = postReview.manager_id;
+      }
       
       normalizedResults.push({
         employee_id: employeeId,
-        manager_id: review.manager_id,
+        manager_id: managerId,
         raw_rating: rawOverallRating,
-        boxcox_manager_level_rating: managerNormalized ?? null,
-        boxcox_grade_level_rating: gradeNormalized ?? null,
+        boxcox_manager_level_rating: (postReview && managerNormalizedRatings.get(employeeId)) ?? null,
+        boxcox_grade_level_rating: (postReview && gradeNormalizedRatings.get(employeeId)) ?? null,
         final_normalized_rating: finalRating,
         normalized_kpi_ratings: null, // KPIs not normalized
         normalized_kra_ratings: null, // KRAs not normalized
@@ -465,7 +563,11 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
         const existingCheck = await query(
           `SELECT id, status FROM normalized_ratings 
            WHERE employee_id = $1 AND performance_cycle_id = $2 AND quarter = $3`,
-          [result.employee_id ?? null, cycleId ?? null, quarter ?? null]
+          [
+            result.employee_id ?? null, 
+            cycleId ?? null, 
+            quarter ?? null
+          ]
         );
         
         // Skip if already published
@@ -474,11 +576,15 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
           continue;
         }
         
-        // Upsert
+        // Upsert - check again with same criteria
         const existingCheck2 = await query(
           `SELECT id, status FROM normalized_ratings 
            WHERE employee_id = $1 AND performance_cycle_id = $2 AND quarter = $3`,
-          [result.employee_id ?? null, cycleId ?? null, quarter ?? null]
+          [
+            result.employee_id ?? null, 
+            cycleId ?? null, 
+            quarter ?? null
+          ]
         );
         
         let upsertResult;

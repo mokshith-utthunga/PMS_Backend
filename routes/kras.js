@@ -1,7 +1,8 @@
 import express from 'express';
 import { query } from '../config/database.js';
-import { authMiddleware, requireRole } from '../middleware/auth.js';
+import { authMiddleware, requireRole, hasAnyRole } from '../middleware/auth.js';
 import { checkManagerOrDelegate } from './delegations.js';
+import { hasActiveTransition, canPerformTransitionActions, getManagerRoleForTransition } from '../services/transitionService.js';
 
 const router = express.Router();
 
@@ -9,6 +10,19 @@ const router = express.Router();
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const { employee_id, cycle_id, status, quarter, period_type, transition_id } = req.query;
+    
+    // Get current user's employee ID (for manager role check)
+    let managerId = null;
+    if (employee_id && cycle_id && quarter) {
+      // Only check manager role if viewing another employee's data
+      const empResult = await query(
+        'SELECT id FROM employees WHERE profile_id = $1',
+        [req.user.userId]
+      );
+      if (empResult.rows.length > 0) {
+        managerId = empResult.rows[0].id;
+      }
+    }
     
     let sql = 'SELECT * FROM kras WHERE 1=1';
     const params = [];
@@ -37,9 +51,62 @@ router.get('/', authMiddleware, async (req, res) => {
     if (transition_id) {
       sql += ` AND transition_id = $${idx++}`;
       params.push(transition_id);
-    } else if (period_type && period_type !== 'full_quarter') {
-      // If period_type is specified but not full_quarter, ensure we filter by transition_id
-      sql += ` AND transition_id IS NOT NULL`;
+    } else {
+      // When transition_id is not provided, only return KRAs where transition_id IS NULL
+      // This ensures we only get pre-transition and full_quarter KRAs (not post-transition)
+      sql += ` AND transition_id IS NULL`;
+    }
+
+
+    if (managerId && employee_id && cycle_id && employee_id !== managerId) {
+      if (quarter) {
+        // Quarter is provided - filter for this specific quarter
+        const managerRole = await getManagerRoleForTransition(managerId, employee_id, cycle_id, parseInt(quarter));
+        
+        if (managerRole === 'old_manager') {
+          // Old manager: only pre-transition and full_quarter KRAs (NOT post-transition)
+          // Old manager should NOT see new goals (post-transition KRAs)
+          sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'pre_transition'::period_type)`;
+        } else if (managerRole === 'new_manager') {
+          // New manager: only post-transition KRAs
+          sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'post_transition'::period_type)`;
+        } else if (managerRole === 'same_manager') {
+          // Same manager: both pre and post-transition (no additional filter needed)
+        }
+        // If managerRole is null, user is not involved in transition, show all data
+      } else {
+        // Quarter not provided - check all quarters for transitions and filter accordingly
+        // This is a fallback for when quarter is not specified
+        const transitionsResult = await query(
+          `SELECT quarter, old_manager_id, new_manager_id 
+           FROM employee_quarter_transitions 
+           WHERE employee_id = $1 AND cycle_id = $2`,
+          [employee_id, cycle_id]
+        );
+        
+        if (transitionsResult.rows.length > 0) {
+          // Check if manager is involved in any transition
+          // Note: If new_manager_id is null/empty, it is considered as the same manager
+          const isOldManager = transitionsResult.rows.some(t => {
+            const isOld = t.old_manager_id === managerId;
+            const isNewManagerIdEmpty = !t.new_manager_id || t.new_manager_id === '';
+            // Only treat as old_manager if managers are different (new_manager_id exists and is different)
+            // If new_manager_id is null/empty, it's same_manager, so don't filter
+            return isOld && !isNewManagerIdEmpty && t.new_manager_id !== t.old_manager_id;
+          });
+          const isNewManager = transitionsResult.rows.some(t => t.new_manager_id && t.new_manager_id === managerId && t.new_manager_id !== t.old_manager_id);
+          
+          if (isOldManager && !isNewManager) {
+            // Manager is only old manager (different managers): only pre-transition and full_quarter KRAs (NOT post-transition)
+            // Old manager should NOT see new goals (post-transition KRAs)
+            sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'pre_transition'::period_type)`;
+          } else if (isNewManager && !isOldManager) {
+            // Manager is only new manager (different managers): only post-transition KRAs
+            sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'post_transition'::period_type)`;
+          }
+          // If manager is both old and new (same_manager) or neither, show all data
+        }
+      }
     }
 
     sql += ' ORDER BY created_at ASC';
@@ -88,16 +155,106 @@ router.get('/my', authMiddleware, async (req, res) => {
 // POST /api/kras
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, title, description, weight, status, quarter, kra_template_id } = req.body;
+    const { employee_id, cycle_id, title, description, weight, status, quarter, kra_template_id, period_type, transition_id } = req.body;
     
+    // Auto-detect transition if not explicitly provided
+    let periodType = period_type || null;
+    let transitionId = transition_id || null;
+    let periodStartDate = null;
+    let periodEndDate = null;
+    let hasActiveTransitionFlag = false;
+
+    if (employee_id && cycle_id && quarter && !periodType && !transitionId) {
+      // Check if there's an active transition for this employee/cycle/quarter
+      hasActiveTransitionFlag = await hasActiveTransition(employee_id, cycle_id, quarter);
+      
+      if (hasActiveTransitionFlag) {
+        const transitionResult = await query(
+          `SELECT id, transition_date
+           FROM employee_quarter_transitions 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+          [employee_id, cycle_id, quarter]
+        );
+
+        if (transitionResult.rows.length > 0) {
+          const transition = transitionResult.rows[0];
+          transitionId = transition.id;
+          const transitionDate = new Date(transition.transition_date);
+          const now = new Date();
+          transitionDate.setHours(0, 0, 0, 0);
+          
+          // Get quarter date range from quarterly_cycles table
+          const quarterRange = await query(
+            `SELECT quarter_start_date, quarter_end_date 
+             FROM quarterly_cycles 
+             WHERE performance_cycle_id = $1 AND quarter = $2`,
+            [cycle_id, quarter]
+          );
+          
+          if (quarterRange.rows.length > 0) {
+            const quarterStart = new Date(quarterRange.rows[0].quarter_start_date);
+            const quarterEnd = new Date(quarterRange.rows[0].quarter_end_date);
+            
+            if (now >= transitionDate) {
+              // KRA is being created after transition, mark as post_transition
+              periodType = 'post_transition';
+              // Format transition date directly to avoid timezone issues
+              // transition.transition_date is already a date string from DB, use it directly
+              periodStartDate = transition.transition_date instanceof Date 
+                ? transition.transition_date.toISOString().split('T')[0]
+                : (typeof transition.transition_date === 'string' 
+                  ? transition.transition_date.split('T')[0] 
+                  : transitionDate.toISOString().split('T')[0]);
+              periodEndDate = quarterEnd.toISOString().split('T')[0];
+            } else {
+              // KRA is being created before transition, mark as pre_transition
+              periodType = 'pre_transition';
+              periodStartDate = quarterStart.toISOString().split('T')[0];
+              // For pre-transition end date, use the transition date itself (not transition date - 1)
+              // Format transition date directly to avoid timezone issues
+              periodEndDate = transition.transition_date instanceof Date
+                ? transition.transition_date.toISOString().split('T')[0]
+                : (typeof transition.transition_date === 'string'
+                  ? transition.transition_date.split('T')[0]
+                  : transitionDate.toISOString().split('T')[0]);
+            }
+          }
+        }
+      }
+    } else if (transition_id || period_type) {
+      hasActiveTransitionFlag = true;
+    }
     
     const result = await query(
-      `INSERT INTO kras (id, employee_id, cycle_id, kra_template_id, title, description, weight, status, quarter, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      `INSERT INTO kras (id, employee_id, cycle_id, kra_template_id, title, description, weight, status, quarter, period_type, transition_id, period_start_date, period_end_date, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9::period_type, $10, $11, $12, NOW(), NOW())
        RETURNING *`,
-      [employee_id, cycle_id, kra_template_id || null, title, description, weight, status || 'draft', quarter || null]
+      [
+        employee_id, 
+        cycle_id, 
+        kra_template_id || null, 
+        title, 
+        description, 
+        weight, 
+        status || 'draft', 
+        quarter || null,
+        periodType,
+        transitionId,
+        periodStartDate,
+        periodEndDate
+      ]
     );
-    res.status(201).json({ data: result.rows[0] });
+    
+    // Return response with transition info for frontend date validation bypass
+    const responseData = result.rows[0];
+    if (hasActiveTransitionFlag || transitionId) {
+      // For transition employees: NO validation needed - they can set goals at any time
+      // The only requirement is that a transition exists for this employee/cycle/quarter
+      responseData.has_active_transition = true;
+      responseData.date_validation_bypassed = true;
+    }
+    
+    res.status(201).json({ data: responseData });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -106,7 +263,78 @@ router.post('/', authMiddleware, async (req, res) => {
 // PUT /api/kras/:id
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { title, description, weight, status, quarter } = req.body;
+    const { title, description, weight, status, quarter, manager_comments } = req.body;
+    
+    // Get current KRA details including period_type and transition_id for authorization
+    const currentKraResult = await query(
+      'SELECT employee_id, cycle_id, quarter, period_type, transition_id FROM kras WHERE id = $1',
+      [req.params.id]
+    );
+    
+    if (currentKraResult.rows.length === 0) {
+      return res.status(404).json({ error: 'KRA not found' });
+    }
+    
+    const currentKra = currentKraResult.rows[0];
+    
+    // If status is being changed to 'approved', check authorization
+    if (status === 'approved' && currentKra.employee_id && currentKra.cycle_id && currentKra.quarter) {
+      // Get current user's employee ID
+      const currentUserResult = await query(
+        'SELECT id FROM employees WHERE profile_id = $1',
+        [req.user.userId]
+      );
+      
+      if (currentUserResult.rows.length > 0) {
+        const currentUserId = currentUserResult.rows[0].id;
+        
+        // For transition KRAs, verify the correct manager is approving
+        if (currentKra.period_type && currentKra.period_type !== 'full_quarter' && currentKra.transition_id) {
+          const transitionResult = await query(
+            'SELECT old_manager_id, new_manager_id FROM employee_quarter_transitions WHERE id = $1',
+            [currentKra.transition_id]
+          );
+          
+          if (transitionResult.rows.length > 0) {
+            const transition = transitionResult.rows[0];
+            
+            // For pre-transition KRAs, only old manager can approve
+            if (currentKra.period_type === 'pre_transition') {
+              if (currentUserId !== transition.old_manager_id) {
+                return res.status(403).json({ 
+                  error: 'Only the pre-transition manager can approve pre-transition KRAs' 
+                });
+              }
+            }
+            // For post-transition KRAs, only new manager can approve
+            else if (currentKra.period_type === 'post_transition') {
+              if (currentUserId !== transition.new_manager_id) {
+                return res.status(403).json({ 
+                  error: 'Only the post-transition manager can approve post-transition KRAs' 
+                });
+              }
+            }
+          }
+        }
+        
+        // Check if user is HR/Admin - they can approve any KRA
+        const isHRAdmin = await hasAnyRole(req.user.userId, ['hr_admin', 'system_admin']);
+        
+        // If not HR/Admin, check if user is manager or delegate (includes transition checks)
+        if (!isHRAdmin) {
+          const auth = await checkManagerOrDelegate(
+            req.user.userId,
+            currentKra.employee_id,
+            currentKra.cycle_id,
+            currentKra.quarter
+          );
+          
+          if (!auth.isAuthorized) {
+            return res.status(403).json({ error: 'Not authorized to approve this KRA' });
+          }
+        }
+      }
+    }
     
     const result = await query(
       `UPDATE kras SET
@@ -115,14 +343,16 @@ router.put('/:id', authMiddleware, async (req, res) => {
         weight = COALESCE($3, weight),
         status = COALESCE($4, status),
         quarter = COALESCE($5, quarter),
+        manager_comments = COALESCE($6, manager_comments),
         updated_at = NOW()
-       WHERE id = $6 RETURNING *`,
+       WHERE id = $7 RETURNING *`,
       [
         title ?? null,
         description ?? null,
         weight ?? null,
         status ?? null,
         quarter ?? null,
+        manager_comments ?? null,
         req.params.id
       ]
     );
@@ -139,15 +369,34 @@ router.put('/:id', authMiddleware, async (req, res) => {
 // DELETE /api/kras/:id
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    const result = await query(
-      'DELETE FROM kras WHERE id = $1 RETURNING id',
-      [req.params.id]
+    const { id } = req.params;
+    
+    // First check if KRA exists
+    const checkResult = await query(
+      'SELECT id, employee_id, cycle_id, quarter, status FROM kras WHERE id = $1',
+      [id]
     );
-    if (result.rows.length === 0) {
+    
+    if (checkResult.rows.length === 0) {
       return res.status(404).json({ error: 'KRA not found' });
     }
-    res.json({ message: 'KRA deleted' });
+    
+    const kra = checkResult.rows[0];
+    
+    // Delete the KRA (this will cascade delete associated KPIs due to ON DELETE CASCADE)
+    const result = await query(
+      'DELETE FROM kras WHERE id = $1 RETURNING id',
+      [id]
+    );
+    
+    if (result.rows.length === 0) {
+      // This shouldn't happen if checkResult found it, but handle it anyway
+      return res.status(404).json({ error: 'KRA not found or could not be deleted' });
+    }
+    
+    res.json({ message: 'KRA deleted successfully' });
   } catch (error) {
+    console.error('Delete KRA error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -212,190 +461,6 @@ router.post('/submit', authMiddleware, async (req, res) => {
       [kra_ids]
     );
     res.json({ data: result.rows });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ========== BONUS KRAS ==========
-
-// GET /api/kras/bonus
-router.get('/bonus', authMiddleware, async (req, res) => {
-  try {
-    const { employee_id, cycle_id, status } = req.query;
-    
-    let sql = 'SELECT * FROM bonus_kras WHERE 1=1';
-    const params = [];
-    let idx = 1;
-
-    if (employee_id) {
-      sql += ` AND employee_id = $${idx++}`;
-      params.push(employee_id);
-    }
-    if (cycle_id) {
-      sql += ` AND cycle_id = $${idx++}`;
-      params.push(cycle_id);
-    }
-    if (status) {
-      sql += ` AND status = $${idx++}`;
-      params.push(status);
-    }
-
-    sql += ' ORDER BY created_at ASC';
-    const result = await query(sql, params);
-    res.json({ data: result.rows });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// POST /api/kras/bonus
-router.post('/bonus', authMiddleware, async (req, res) => {
-  try {
-    const { employee_id, cycle_id, title, description, status } = req.body;
-    
-    const result = await query(
-      `INSERT INTO bonus_kras (id, employee_id, cycle_id, title, description, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW(), NOW())
-       RETURNING *`,
-      [employee_id, cycle_id, title, description, status || 'draft']
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// PUT /api/kras/bonus/:id
-router.put('/bonus/:id', authMiddleware, async (req, res) => {
-  try {
-    const { title, description, status } = req.body;
-    
-    const result = await query(
-      `UPDATE bonus_kras SET
-        title = COALESCE($1, title),
-        description = COALESCE($2, description),
-        status = COALESCE($3, status),
-        updated_at = NOW()
-       WHERE id = $4 RETURNING *`,
-      [
-        title ?? null,
-        description ?? null,
-        status ?? null,
-        req.params.id
-      ]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Bonus KRA not found' });
-    }
-    res.json({ data: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// DELETE /api/kras/bonus/:id
-router.delete('/bonus/:id', authMiddleware, async (req, res) => {
-  try {
-    const result = await query(
-      'DELETE FROM bonus_kras WHERE id = $1 RETURNING id',
-      [req.params.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Bonus KRA not found' });
-    }
-    res.json({ message: 'Bonus KRA deleted' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ========== BONUS KPIS ==========
-
-// GET /api/kras/bonus-kpis
-router.get('/bonus-kpis', authMiddleware, async (req, res) => {
-  try {
-    const { bonus_kra_id } = req.query;
-    
-    let sql = 'SELECT * FROM bonus_kpis WHERE 1=1';
-    const params = [];
-    let idx = 1;
-
-    if (bonus_kra_id) {
-      sql += ` AND bonus_kra_id = $${idx++}`;
-      params.push(bonus_kra_id);
-    }
-
-    sql += ' ORDER BY created_at ASC';
-    const result = await query(sql, params);
-    res.json({ data: result.rows });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// POST /api/kras/bonus-kpis
-router.post('/bonus-kpis', authMiddleware, async (req, res) => {
-  try {
-    const { bonus_kra_id, title, description, metric_type, target_value, status } = req.body;
-    
-    const result = await query(
-      `INSERT INTO bonus_kpis (id, bonus_kra_id, title, description, metric_type, target_value, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), NOW())
-       RETURNING *`,
-      [bonus_kra_id, title, description, metric_type || 'number', target_value, status || 'draft']
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// PUT /api/kras/bonus-kpis/:id
-router.put('/bonus-kpis/:id', authMiddleware, async (req, res) => {
-  try {
-    const { title, description, metric_type, target_value, status } = req.body;
-    
-    const result = await query(
-      `UPDATE bonus_kpis SET
-        title = COALESCE($1, title),
-        description = COALESCE($2, description),
-        metric_type = COALESCE($3, metric_type),
-        target_value = $4,
-        status = COALESCE($5, status),
-        updated_at = NOW()
-       WHERE id = $6 RETURNING *`,
-      [
-        title ?? null,
-        description ?? null,
-        metric_type ?? null,
-        target_value ?? null,
-        status ?? null,
-        req.params.id
-      ]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Bonus KPI not found' });
-    }
-    res.json({ data: result.rows[0] });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// DELETE /api/kras/bonus-kpis/:id
-router.delete('/bonus-kpis/:id', authMiddleware, async (req, res) => {
-  try {
-    const result = await query(
-      'DELETE FROM bonus_kpis WHERE id = $1 RETURNING id',
-      [req.params.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Bonus KPI not found' });
-    }
-    res.json({ message: 'Bonus KPI deleted' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

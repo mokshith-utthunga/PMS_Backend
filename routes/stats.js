@@ -65,12 +65,35 @@ router.get('/manager-dashboard', authMiddleware, async (req, res) => {
     const managerCode = empResult.rows[0].emp_code;
     
     const [team, pending, completed] = await Promise.all([
-      query('SELECT COUNT(*) FROM employees WHERE manager_code = $1', [managerCode]),
+      query(`
+        SELECT COUNT(DISTINCT e.id) 
+        FROM employees e
+        WHERE (
+          e.manager_code = $1
+          OR EXISTS (
+            SELECT 1 FROM employee_quarter_transitions eqt
+            WHERE eqt.employee_id = e.id
+              AND eqt.new_manager_id = $2
+              AND eqt.transition_date <= CURRENT_DATE
+          )
+        )
+      `, [managerCode, managerId]),
       query(`
         SELECT COUNT(*) FROM goals g
         JOIN employees e ON g.employee_id = e.id
-        WHERE e.manager_code = $1 AND g.status = 'submitted'
-      `, [managerCode]),
+        WHERE g.status = 'submitted'
+          AND (
+            e.manager_code = $1
+            OR EXISTS (
+              SELECT 1 FROM employee_quarter_transitions eqt
+              WHERE eqt.employee_id = e.id
+                AND eqt.new_manager_id = $2
+                AND eqt.cycle_id = g.cycle_id
+                AND eqt.quarter = g.quarter
+                AND eqt.transition_date <= CURRENT_DATE
+            )
+          )
+      `, [managerCode, managerId]),
       query(`
         SELECT COUNT(*) FROM manager_evaluations 
         WHERE evaluator_id = $1 AND status = 'submitted'

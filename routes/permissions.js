@@ -14,6 +14,178 @@ router.get('/late-submission', authMiddleware, requireRole(['hr_admin', 'system_
       const isYearEnd = quarter === 'year-end';
       const quarterNum = isYearEnd ? null : (parseInt(quarter) || 1);
       
+      // ========== MANAGER EVALUATIONS LOGIC ==========
+      if (type === 'manager-evaluations') {
+        if (isYearEnd) {
+          return res.status(400).json({ error: 'Manager evaluations are only supported for quarterly periods, not year-end' });
+        }
+        
+        // Get manager review end date to check eligibility
+        const qcResult = await query(
+          `SELECT manager_review_start_date, manager_review_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarterNum]
+        );
+        
+        if (qcResult.rows.length === 0) {
+          return res.status(404).json({ error: 'Quarterly cycle not found for this quarter' });
+        }
+        
+        const managerReviewEndDate = qcResult.rows[0].manager_review_end_date;
+        const managerReviewStartDate = qcResult.rows[0].manager_review_start_date;
+        
+        if (!managerReviewEndDate) {
+          return res.status(400).json({ error: 'Manager review end date is not configured for this quarter' });
+        }
+        
+        // Check eligibility: only show data when manager review window has ended
+        const now = new Date();
+        now.setHours(0, 0, 0, 0);
+        const endDate = new Date(managerReviewEndDate);
+        endDate.setHours(23, 59, 59, 999);
+        
+        if (now <= endDate) {
+          // Manager review window hasn't ended yet - return empty data
+          return res.json({ data: [] });
+        }
+        
+        // Get all managers (employees who have reportees) for this quarter
+        // A manager is someone who has at least one active reportee
+        let managersSql = `SELECT DISTINCT m.id, m.emp_code, m.full_name, m.email, m.department, m.date_of_joining
+           FROM employees m
+           WHERE m.status = 'active'
+           AND EXISTS (
+             SELECT 1 FROM employees e 
+             WHERE e.manager_code = m.emp_code 
+             AND e.status = 'active'`;
+        let managersParams = [];
+        if (managerReviewStartDate) {
+          managersSql += ` AND e.date_of_joining <= $1`;
+          managersParams.push(managerReviewStartDate);
+        }
+        managersSql += `)`;
+        if (managerReviewStartDate) {
+          managersSql += ` AND m.date_of_joining <= $${managersParams.length + 1}`;
+          managersParams.push(managerReviewStartDate);
+        }
+        managersSql += ` ORDER BY m.full_name`;
+        const managersResult = await query(managersSql, managersParams);
+        
+        // Get all reportees for each manager
+        let reporteesSql = `SELECT e.id as reportee_id, e.emp_code as reportee_emp_code, e.full_name as reportee_name,
+                  e.date_of_joining as reportee_date_of_joining, e.manager_code,
+                  m.id as manager_id, m.emp_code as manager_emp_code, m.full_name as manager_name
+           FROM employees e
+           INNER JOIN employees m ON m.emp_code = e.manager_code
+           WHERE e.status = 'active' AND m.status = 'active'`;
+        let reporteesParams = [];
+        if (managerReviewStartDate) {
+          reporteesSql += ` AND e.date_of_joining <= $1`;
+          reporteesParams.push(managerReviewStartDate);
+        }
+        reporteesSql += ` ORDER BY m.full_name, e.full_name`;
+        const reporteesResult = await query(reporteesSql, reporteesParams);
+        
+        // Get completed manager reviews for this quarter
+        // A review is considered completed if status is 'submitted', 'calibrated', or 'released'
+        const completedReviewsResult = await query(
+          `SELECT employee_id, reviewer_id
+           FROM quarterly_manager_reviews
+           WHERE cycle_id = $1 AND quarter = $2 
+           AND status IN ('submitted', 'calibrated', 'released')`,
+          [cycle_id, quarterNum]
+        );
+        
+        // Create a set of completed reviews: employee_id -> reviewer_id
+        const completedReviews = new Set();
+        completedReviewsResult.rows.forEach(r => {
+          completedReviews.add(`${r.employee_id}_${r.reviewer_id}`);
+        });
+        
+        // Group reportees by manager
+        const reporteesByManager = new Map();
+        reporteesResult.rows.forEach(r => {
+          const managerId = r.manager_id;
+          if (!reporteesByManager.has(managerId)) {
+            reporteesByManager.set(managerId, {
+              manager_id: managerId,
+              manager_emp_code: r.manager_emp_code,
+              manager_name: r.manager_name,
+              reportees: []
+            });
+          }
+          reporteesByManager.get(managerId).reportees.push({
+            employee_id: r.reportee_id,
+            emp_code: r.reportee_emp_code,
+            employee_name: r.reportee_name,
+            date_of_joining: r.reportee_date_of_joining
+          });
+        });
+        
+        // Get existing late submission permissions for managers
+        const permissionsResult = await query(
+          `SELECT * FROM late_submission_permissions 
+           WHERE cycle_id = $1 AND (quarter = $2 OR quarter IS NULL) AND revoked_at IS NULL`,
+          [cycle_id, quarterNum]
+        );
+        const permissionsMap = new Map();
+        permissionsResult.rows.forEach(p => {
+          const existingPerm = permissionsMap.get(p.employee_id);
+          if (!existingPerm || (p.quarter !== null && existingPerm.quarter === null)) {
+            permissionsMap.set(p.employee_id, p);
+          }
+        });
+        
+        // Build response: managers with pending reportee reviews
+        const response = [];
+        
+        for (const manager of managersResult.rows) {
+          const managerData = reporteesByManager.get(manager.id);
+          if (!managerData || managerData.reportees.length === 0) {
+            continue; // Skip managers with no reportees
+          }
+          
+          // Check if all reportees have completed manager reviews
+          const pendingReportees = [];
+          let allCompleted = true;
+          
+          for (const reportee of managerData.reportees) {
+            const reviewKey = `${reportee.employee_id}_${manager.id}`;
+            if (!completedReviews.has(reviewKey)) {
+              allCompleted = false;
+              pendingReportees.push(reportee);
+            }
+          }
+          
+          // Include manager if they have pending reportees OR have permission
+          const hasPermission = permissionsMap.has(manager.id);
+          if (!allCompleted || hasPermission) {
+            if (!employee_id || manager.id === employee_id) {
+              response.push({
+                employee_id: manager.id,
+                emp_code: manager.emp_code,
+                employee_name: manager.full_name,
+                employee_email: manager.email,
+                department: manager.department,
+                date_of_joining: manager.date_of_joining,
+                manager_code: null,
+                manager_id: null,
+                manager_emp_code: null,
+                manager_name: null,
+                has_submitted: allCompleted,
+                permission: hasPermission ? permissionsMap.get(manager.id) : null,
+                needs_permission: !allCompleted && !hasPermission,
+                pending_reportees: pendingReportees
+              });
+            }
+          }
+        }
+        
+        return res.json({ data: response });
+      }
+      
+      // ========== EXISTING GOALS/EVALUATIONS LOGIC ==========
       // Get dates based on type (goals or evaluations)
       let startDate = null;
       
@@ -95,23 +267,49 @@ router.get('/late-submission', authMiddleware, requireRole(['hr_admin', 'system_
       );
       
       // Get employees who have submitted
-      // For year-end: check self_evaluations table where quarter IS NULL
-      // For quarters: check quarterly_self_reviews table
+      // For goals: check goals table where status IN ('submitted', 'approved')
+      // For evaluations: check quarterly_self_reviews or self_evaluations table
+      // For manager-evaluations: handled separately above
       let submittedResult;
-      if (isYearEnd) {
-        submittedResult = await query(
-          `SELECT DISTINCT employee_id 
-           FROM self_evaluations 
-           WHERE cycle_id = $1 AND quarter IS NULL AND status = 'submitted'`,
-          [cycle_id]
-        );
+      if (type === 'goals') {
+        // For goals, check if employee has any goals with status 'submitted' or 'approved'
+        if (isYearEnd) {
+          // Year-end goals don't have quarter, but we still need to check goals table
+          // Note: Goals are typically quarter-based, so year-end might not apply
+          submittedResult = await query(
+            `SELECT DISTINCT employee_id 
+             FROM goals 
+             WHERE cycle_id = $1 AND status IN ('submitted', 'approved')`,
+            [cycle_id]
+          );
+        } else {
+          submittedResult = await query(
+            `SELECT DISTINCT employee_id 
+             FROM goals 
+             WHERE cycle_id = $1 AND quarter = $2 AND status IN ('submitted', 'approved')`,
+            [cycle_id, quarterNum]
+          );
+        }
+      } else if (type === 'evaluations') {
+        // For evaluations: check quarterly_self_reviews or self_evaluations table
+        if (isYearEnd) {
+          submittedResult = await query(
+            `SELECT DISTINCT employee_id 
+             FROM self_evaluations 
+             WHERE cycle_id = $1 AND quarter IS NULL AND status = 'submitted'`,
+            [cycle_id]
+          );
+        } else {
+          submittedResult = await query(
+            `SELECT DISTINCT employee_id 
+             FROM quarterly_self_reviews 
+             WHERE cycle_id = $1 AND quarter = $2 AND status = 'submitted'`,
+            [cycle_id, quarterNum]
+          );
+        }
       } else {
-        submittedResult = await query(
-          `SELECT DISTINCT employee_id 
-           FROM quarterly_self_reviews 
-           WHERE cycle_id = $1 AND quarter = $2 AND status = 'submitted'`,
-          [cycle_id, quarterNum]
-        );
+        // For manager-evaluations, this should not reach here (handled above)
+        submittedResult = { rows: [] };
       }
       const submittedEmployeeIds = new Set(submittedResult.rows.map(r => r.employee_id));
       
@@ -463,8 +661,8 @@ router.put('/late-submission/:cycleId/:employeeId/revoke', authMiddleware, requi
   }
 });
 
-// GET /api/permissions/late-submission-details - Get late submission statistics (Unified for Goals + Evaluations)
-// Accepts optional 'type' parameter: 'goals' | 'evaluations' to determine which dates to check for quarter accessibility
+// GET /api/permissions/late-submission-details - Get late submission statistics (Unified for Goals + Evaluations + Manager Evaluations)
+// Accepts optional 'type' parameter: 'goals' | 'evaluations' | 'manager-evaluations' to determine which dates to check for quarter accessibility
 // Restricted to HR Admin and System Admin
 router.get('/late-submission-details', authMiddleware, requireRole(['hr_admin', 'system_admin']), async (req, res) => {
   try {
@@ -479,6 +677,155 @@ router.get('/late-submission-details', authMiddleware, requireRole(['hr_admin', 
     const quarterNum = isYearEnd ? null : (quarter ? parseInt(quarter) : 1);
     if (!isYearEnd && (quarterNum < 1 || quarterNum > 4)) {
       return res.status(400).json({ error: 'quarter must be between 1 and 4, or "year-end"' });
+    }
+    
+    // ========== MANAGER EVALUATIONS LOGIC ==========
+    if (type === 'manager-evaluations') {
+      if (isYearEnd) {
+        return res.status(400).json({ error: 'Manager evaluations are only supported for quarterly periods, not year-end' });
+      }
+      
+      // Get manager review dates
+      const qcResult = await query(
+        `SELECT manager_review_start_date, manager_review_end_date 
+         FROM quarterly_cycles 
+         WHERE performance_cycle_id = $1 AND quarter = $2`,
+        [cycle_id, quarterNum]
+      );
+      
+      if (qcResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Quarterly cycle not found for this quarter' });
+      }
+      
+      const managerReviewStartDate = qcResult.rows[0].manager_review_start_date;
+      const managerReviewEndDate = qcResult.rows[0].manager_review_end_date;
+      
+      if (!managerReviewEndDate) {
+        return res.status(400).json({ error: 'Manager review end date is not configured for this quarter' });
+      }
+      
+      const now = new Date();
+      now.setHours(0, 0, 0, 0);
+      const endDate = new Date(managerReviewEndDate);
+      endDate.setHours(23, 59, 59, 999);
+      
+      const isPastDeadline = now > endDate;
+      const hasStarted = managerReviewStartDate ? (now >= new Date(managerReviewStartDate)) : false;
+      
+      // Get all managers (employees who have reportees)
+      let managersSql = `SELECT DISTINCT m.id
+         FROM employees m
+         WHERE m.status = 'active'
+         AND EXISTS (
+           SELECT 1 FROM employees e 
+           WHERE e.manager_code = m.emp_code 
+           AND e.status = 'active'`;
+      let managersParams = [];
+      if (managerReviewStartDate) {
+        managersSql += ` AND e.date_of_joining <= $1`;
+        managersParams.push(managerReviewStartDate);
+      }
+      managersSql += `)`;
+      if (managerReviewStartDate) {
+        managersSql += ` AND m.date_of_joining <= $${managersParams.length + 1}`;
+        managersParams.push(managerReviewStartDate);
+      }
+      const managersResult = await query(managersSql, managersParams);
+      
+      const totalManagers = managersResult.rows.length;
+      
+      // Get all reportees grouped by manager
+      let reporteesSql = `SELECT e.id as reportee_id, m.id as manager_id
+         FROM employees e
+         INNER JOIN employees m ON m.emp_code = e.manager_code
+         WHERE e.status = 'active' AND m.status = 'active'`;
+      let reporteesParams = [];
+      if (managerReviewStartDate) {
+        reporteesSql += ` AND e.date_of_joining <= $1`;
+        reporteesParams.push(managerReviewStartDate);
+      }
+      const reporteesResult = await query(reporteesSql, reporteesParams);
+      
+      // Group reportees by manager
+      const reporteesByManager = new Map();
+      reporteesResult.rows.forEach(r => {
+        if (!reporteesByManager.has(r.manager_id)) {
+          reporteesByManager.set(r.manager_id, []);
+        }
+        reporteesByManager.get(r.manager_id).push(r.reportee_id);
+      });
+      
+      // Get completed manager reviews
+      // A review is considered completed if status is 'submitted', 'calibrated', or 'released'
+      const completedReviewsResult = await query(
+        `SELECT employee_id, reviewer_id
+         FROM quarterly_manager_reviews
+         WHERE cycle_id = $1 AND quarter = $2 
+         AND status IN ('submitted', 'calibrated', 'released')`,
+        [cycle_id, quarterNum]
+      );
+      
+      // Create a set of completed reviews: employee_id -> reviewer_id
+      const completedReviews = new Set();
+      completedReviewsResult.rows.forEach(r => {
+        completedReviews.add(`${r.employee_id}_${r.reviewer_id}`);
+      });
+      
+      // Count managers who have completed all reportee reviews
+      let submittedManagers = 0;
+      let missedDeadlineManagers = 0;
+      
+      for (const manager of managersResult.rows) {
+        const reportees = reporteesByManager.get(manager.id) || [];
+        if (reportees.length === 0) continue;
+        
+        let allCompleted = true;
+        for (const reporteeId of reportees) {
+          const reviewKey = `${reporteeId}_${manager.id}`;
+          if (!completedReviews.has(reviewKey)) {
+            allCompleted = false;
+            break;
+          }
+        }
+        
+        if (allCompleted) {
+          submittedManagers++;
+        } else if (isPastDeadline) {
+          missedDeadlineManagers++;
+        }
+      }
+      
+      // Get late access granted count for managers
+      const lateAccessResult = await query(
+        `SELECT COUNT(DISTINCT lsp.employee_id) as count
+         FROM late_submission_permissions lsp
+         INNER JOIN employees m ON m.id = lsp.employee_id
+         WHERE lsp.cycle_id = $1 
+         AND (lsp.quarter = $2 OR lsp.quarter IS NULL)
+         AND lsp.revoked_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM employees e 
+           WHERE e.manager_code = m.emp_code 
+           AND e.status = 'active'
+         )`,
+        [cycle_id, quarterNum]
+      );
+      const lateAccessGranted = parseInt(lateAccessResult.rows[0]?.count || 0);
+      
+      return res.json({
+        data: {
+          totalManagers: hasStarted ? totalManagers : 0,
+          managerEvaluations: {
+            submitted: hasStarted ? submittedManagers : 0,
+            missedDeadline: hasStarted ? missedDeadlineManagers : 0,
+            lateAccessGranted: hasStarted ? lateAccessGranted : 0,
+            quarter: quarterNum,
+            isPastDeadline: isPastDeadline,
+            hasStarted: hasStarted,
+            startDate: managerReviewStartDate || null,
+          }
+        }
+      });
     }
 
     // Get performance cycle basic info

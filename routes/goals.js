@@ -1,7 +1,8 @@
 import express from 'express';
 import { query } from '../config/database.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, hasAnyRole } from '../middleware/auth.js';
 import { checkManagerOrDelegate } from './delegations.js';
+import { canPerformTransitionActions, getManagerRoleForTransition } from '../services/transitionService.js';
 
 const router = express.Router();
 
@@ -10,7 +11,26 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     const { employee_id, cycle_id, status, type, quarter, period_type, transition_id } = req.query;
     
-    let sql = 'SELECT * FROM goals WHERE 1=1';
+    // Get current user's employee ID (for manager role check)
+    let managerId = null;
+    if (employee_id && cycle_id && quarter) {
+      // Only check manager role if viewing another employee's data
+      const empResult = await query(
+        'SELECT id FROM employees WHERE profile_id = $1',
+        [req.user.userId]
+      );
+      if (empResult.rows.length > 0) {
+        managerId = empResult.rows[0].id;
+      }
+    }
+    
+    // Explicitly select all columns including quarter to ensure it's returned
+    let sql = `SELECT 
+      id, employee_id, cycle_id, kra_id, kpi_template_id, title, description, 
+      goal_type, metric_type, target_value, weight, calibration, due_date, 
+      status, quarter, period_type, transition_id, period_start_date, period_end_date, 
+      created_at, updated_at 
+    FROM goals WHERE 1=1`;
     const params = [];
     let idx = 1;
 
@@ -41,10 +61,65 @@ router.get('/', authMiddleware, async (req, res) => {
     if (transition_id) {
       sql += ` AND transition_id = $${idx++}`;
       params.push(transition_id);
-    } else if (period_type && period_type !== 'full_quarter') {
-      // If period_type is specified but not full_quarter, ensure we filter by transition_id
-      // This prevents mixing full_quarter goals with transition goals
-      sql += ` AND transition_id IS NOT NULL`;
+    } else {
+      // When transition_id is not provided, only return goals where transition_id IS NULL
+      // This ensures we only get pre-transition and full_quarter goals (not post-transition)
+      sql += ` AND transition_id IS NULL`;
+    }
+
+    // Apply manager role filtering if viewing another employee's data
+    // If quarter is provided, filter for that specific quarter
+    // If quarter is not provided, check all quarters for transitions
+    // Note: If new_manager_id is null/empty, it is considered as the old manager
+    if (managerId && employee_id && cycle_id && employee_id !== managerId) {
+      if (quarter) {
+        // Quarter is provided - filter for this specific quarter
+        const managerRole = await getManagerRoleForTransition(managerId, employee_id, cycle_id, parseInt(quarter));
+        
+        if (managerRole === 'old_manager') {
+          // Old manager: only pre-transition and full_quarter goals (NOT post-transition)
+          // Old manager should NOT see new goals (post-transition goals)
+          sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'pre_transition'::period_type)`;
+        } else if (managerRole === 'new_manager') {
+          // New manager: only post-transition goals
+          sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'post_transition'::period_type)`;
+        } else if (managerRole === 'same_manager') {
+          // Same manager: both pre and post-transition (no additional filter needed)
+        }
+        // If managerRole is null, user is not involved in transition, show all data
+      } else {
+        // Quarter not provided - check all quarters for transitions and filter accordingly
+        // This is a fallback for when quarter is not specified
+        const transitionsResult = await query(
+          `SELECT quarter, old_manager_id, new_manager_id 
+           FROM employee_quarter_transitions 
+           WHERE employee_id = $1 AND cycle_id = $2`,
+          [employee_id, cycle_id]
+        );
+        
+        if (transitionsResult.rows.length > 0) {
+          // Check if manager is involved in any transition
+          // Note: If new_manager_id is null/empty, it is considered as the same manager
+          const isOldManager = transitionsResult.rows.some(t => {
+            const isOld = t.old_manager_id === managerId;
+            const isNewManagerIdEmpty = !t.new_manager_id || t.new_manager_id === '';
+            // Only treat as old_manager if managers are different (new_manager_id exists and is different)
+            // If new_manager_id is null/empty, it's same_manager, so don't filter
+            return isOld && !isNewManagerIdEmpty && t.new_manager_id !== t.old_manager_id;
+          });
+          const isNewManager = transitionsResult.rows.some(t => t.new_manager_id && t.new_manager_id === managerId && t.new_manager_id !== t.old_manager_id);
+          
+          if (isOldManager && !isNewManager) {
+            // Manager is only old manager (different managers): only pre-transition and full_quarter goals (NOT post-transition)
+            // Old manager should NOT see new goals (post-transition goals)
+            sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'pre_transition'::period_type)`;
+          } else if (isNewManager && !isOldManager) {
+            // Manager is only new manager (different managers): only post-transition goals
+            sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'post_transition'::period_type)`;
+          }
+          // If manager is both old and new (same_manager) or neither, show all data
+        }
+      }
     }
 
     sql += ' ORDER BY created_at DESC';
@@ -109,13 +184,30 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
     const managerId = empResult.rows[0].id;
     const managerCode = empResult.rows[0].emp_code;
     
+    // Build base parameters array
+    const params = [managerCode, managerId];
+    let paramIndex = 3;
+    
+    // Build WHERE conditions dynamically
+    let cycleCondition = '';
+    let quarterCondition = '';
+    
+    if (cycle_id) {
+      cycleCondition = ` AND g.cycle_id = $${paramIndex++}`;
+      params.push(cycle_id);
+    }
+    if (quarter) {
+      quarterCondition = ` AND g.quarter = $${paramIndex++}`;
+      params.push(parseInt(quarter));
+    }
+    
     let sql = `
       SELECT DISTINCT g.*, e.full_name, e.email
       FROM goals g
       JOIN employees e ON g.employee_id = e.id
       WHERE g.status = 'submitted'
         AND (
-          e.manager_code = $1
+          (e.manager_code = $1 AND (g.period_type IS NULL OR g.period_type = 'full_quarter'::period_type))
           OR EXISTS (
             SELECT 1 FROM delegations d
             WHERE d.delegate_id = $2
@@ -124,19 +216,41 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
               AND d.quarter = g.quarter
               AND d.revoked_at IS NULL
           )
+          OR EXISTS (
+            -- New manager can see post-transition goals
+            -- Use manager_history for accurate manager tracking (not dependent on employees.manager_code)
+            SELECT 1 FROM employee_quarter_transitions eqt
+            LEFT JOIN manager_history mh ON mh.transition_id = eqt.id
+            WHERE eqt.employee_id = e.id
+              AND eqt.cycle_id = g.cycle_id
+              AND eqt.quarter = g.quarter
+              AND eqt.transition_date <= CURRENT_DATE
+              AND g.period_type = 'post_transition'::period_type
+              AND g.transition_id = eqt.id
+              AND (
+                -- Check manager_history first (more accurate), fallback to transition table
+                (mh.new_manager_id = $2) OR (mh.new_manager_id IS NULL AND eqt.new_manager_id = $2)
+              )
+          )
+          OR EXISTS (
+            -- Old manager can see pre-transition goals
+            -- Use manager_history for accurate manager tracking (not dependent on employees.manager_code)
+            SELECT 1 FROM employee_quarter_transitions eqt
+            LEFT JOIN manager_history mh ON mh.transition_id = eqt.id
+            WHERE eqt.employee_id = e.id
+              AND eqt.cycle_id = g.cycle_id
+              AND eqt.quarter = g.quarter
+              AND g.period_type = 'pre_transition'::period_type
+              AND g.transition_id = eqt.id
+              AND (
+                -- Check manager_history first (more accurate), fallback to transition table
+                (mh.old_manager_id = $2) OR (mh.old_manager_id IS NULL AND eqt.old_manager_id = $2)
+              )
+          )
         )
+        ${cycleCondition}
+        ${quarterCondition}
     `;
-    const params = [managerCode, managerId];
-    let idx = 3;
-    
-    if (cycle_id) {
-      sql += ` AND g.cycle_id = $${idx++}`;
-      params.push(cycle_id);
-    }
-    if (quarter) {
-      sql += ` AND g.quarter = $${idx++}`;
-      params.push(parseInt(quarter));
-    }
     
     const result = await query(sql, params);
     const uniqueEmployees = new Set(result.rows.map(row => row.employee_id));
@@ -280,7 +394,7 @@ router.post('/clone', authMiddleware, async (req, res) => {
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
     const result = await query(
-      'SELECT * FROM goals WHERE id = $1',
+      'SELECT * FROM goals WHERE id = $1 ',
       [req.params.id]
     );
     if (result.rows.length === 0) {
@@ -314,6 +428,7 @@ router.post('/', authMiddleware, async (req, res) => {
     let transitionId = transition_id || null;
     let periodStartDate = null;
     let periodEndDate = null;
+    let hasActiveTransition = false;
 
     if (employee_id && cycle_id && quarter && !periodType && !transitionId) {
       // Check if there's an active transition for this employee/cycle/quarter
@@ -325,39 +440,54 @@ router.post('/', authMiddleware, async (req, res) => {
       );
 
       if (transitionResult.rows.length > 0) {
+        hasActiveTransition = true;
         const transition = transitionResult.rows[0];
         transitionId = transition.id;
         const transitionDate = new Date(transition.transition_date);
         const now = new Date();
         transitionDate.setHours(0, 0, 0, 0);
         
-        // Get quarter date range
+        // Get quarter date range from quarterly_cycles table
         const quarterRange = await query(
-          `SELECT quarterly_start_date, quarterly_end_date 
-           FROM goals_quarterly_cycles 
+          `SELECT quarter_start_date, quarter_end_date 
+           FROM quarterly_cycles 
            WHERE performance_cycle_id = $1 AND quarter = $2`,
           [cycle_id, quarter]
         );
         
         if (quarterRange.rows.length > 0) {
-          const quarterStart = new Date(quarterRange.rows[0].quarterly_start_date);
-          const quarterEnd = new Date(quarterRange.rows[0].quarterly_end_date);
+          const quarterStart = new Date(quarterRange.rows[0].quarter_start_date);
+          const quarterEnd = new Date(quarterRange.rows[0].quarter_end_date);
           
           if (now >= transitionDate) {
             // Goal is being created after transition, mark as post_transition
+            // Note: Date validation is bypassed for post-transition goals per workflow requirements
             periodType = 'post_transition';
-            periodStartDate = transitionDate.toISOString().split('T')[0];
+            // Format transition date directly to avoid timezone issues
+            // transition.transition_date is already a date string from DB, use it directly
+            periodStartDate = transition.transition_date instanceof Date 
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string' 
+                ? transition.transition_date.split('T')[0] 
+                : transitionDate.toISOString().split('T')[0]);
             periodEndDate = quarterEnd.toISOString().split('T')[0];
           } else {
             // Goal is being created before transition, mark as pre_transition
             periodType = 'pre_transition';
             periodStartDate = quarterStart.toISOString().split('T')[0];
-            const preEndDate = new Date(transitionDate);
-            preEndDate.setDate(preEndDate.getDate() - 1);
-            periodEndDate = preEndDate.toISOString().split('T')[0];
+            // For pre-transition end date, use the transition date itself (not transition date - 1)
+            // Format transition date directly to avoid timezone issues
+            periodEndDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
           }
         }
       }
+    } else if (transition_id || period_type) {
+      // Transition explicitly provided - check if it exists
+      hasActiveTransition = true;
     }
     
     const result = await query(
@@ -385,7 +515,16 @@ router.post('/', authMiddleware, async (req, res) => {
         periodEndDate
       ]
     );
-    res.status(201).json({ data: result.rows[0] });
+    // Return response with transition info for frontend date validation bypass
+    const responseData = result.rows[0];
+    if (hasActiveTransition || transitionId) {
+      // For transition employees: NO validation needed - they can set goals at any time
+      // The only requirement is that a transition exists for this employee/cycle/quarter
+      responseData.has_active_transition = true;
+      responseData.date_validation_bypassed = true; // Frontend can use this to bypass date checks
+    }
+    
+    res.status(201).json({ data: responseData });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -513,9 +652,9 @@ router.post('/:id/submit', authMiddleware, async (req, res) => {
 // POST /api/goals/:id/approve
 router.post('/:id/approve', authMiddleware, async (req, res) => {
   try {
-    // Get goal details
+    // Get goal details including period_type and transition_id
     const goalResult = await query(
-      'SELECT employee_id, cycle_id, quarter FROM goals WHERE id = $1',
+      'SELECT employee_id, cycle_id, quarter, period_type, transition_id FROM goals WHERE id = $1',
       [req.params.id]
     );
     
@@ -525,16 +664,62 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
     
     const goal = goalResult.rows[0];
     
-    // Check if user is manager or delegate
-    const auth = await checkManagerOrDelegate(
-      req.user.userId,
-      goal.employee_id,
-      goal.cycle_id,
-      goal.quarter
+    // Get current user's employee ID
+    const currentUserResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [req.user.userId]
     );
     
-    if (!auth.isAuthorized) {
-      return res.status(403).json({ error: 'Not authorized to approve this goal' });
+    if (currentUserResult.rows.length === 0) {
+      return res.status(403).json({ error: 'User not found' });
+    }
+    
+    const currentUserId = currentUserResult.rows[0].id;
+    
+    // For transition goals, verify the correct manager is approving
+    if (goal.period_type && goal.period_type !== 'full_quarter' && goal.transition_id) {
+      const transitionResult = await query(
+        'SELECT old_manager_id, new_manager_id FROM employee_quarter_transitions WHERE id = $1',
+        [goal.transition_id]
+      );
+      
+      if (transitionResult.rows.length > 0) {
+        const transition = transitionResult.rows[0];
+        
+        // For pre-transition goals, only old manager can approve
+        if (goal.period_type === 'pre_transition') {
+          if (currentUserId !== transition.old_manager_id) {
+            return res.status(403).json({ 
+              error: 'Only the pre-transition manager can approve pre-transition goals' 
+            });
+          }
+        }
+        // For post-transition goals, only new manager can approve
+        else if (goal.period_type === 'post_transition') {
+          if (currentUserId !== transition.new_manager_id) {
+            return res.status(403).json({ 
+              error: 'Only the post-transition manager can approve post-transition goals' 
+            });
+          }
+        }
+      }
+    }
+    
+    // Check if user is HR/Admin - they can approve any goal
+    const isHRAdmin = await hasAnyRole(req.user.userId, ['hr_admin', 'system_admin']);
+    
+    // If not HR/Admin, check if user is manager or delegate (includes transition checks)
+    if (!isHRAdmin) {
+      const auth = await checkManagerOrDelegate(
+        req.user.userId,
+        goal.employee_id,
+        goal.cycle_id,
+        goal.quarter
+      );
+      
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ error: 'Not authorized to approve this goal' });
+      }
     }
     
     const result = await query(
@@ -552,9 +737,9 @@ router.post('/:id/return', authMiddleware, async (req, res) => {
   try {
     const { comments } = req.body;
     
-    // Get goal details
+    // Get goal details including period_type and transition_id
     const goalResult = await query(
-      'SELECT employee_id, cycle_id, quarter FROM goals WHERE id = $1',
+      'SELECT employee_id, cycle_id, quarter, period_type, transition_id FROM goals WHERE id = $1',
       [req.params.id]
     );
     
@@ -564,7 +749,48 @@ router.post('/:id/return', authMiddleware, async (req, res) => {
     
     const goal = goalResult.rows[0];
     
-    // Check if user is manager or delegate
+    // Get current user's employee ID
+    const currentUserResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [req.user.userId]
+    );
+    
+    if (currentUserResult.rows.length === 0) {
+      return res.status(403).json({ error: 'User not found' });
+    }
+    
+    const currentUserId = currentUserResult.rows[0].id;
+    
+    // For transition goals, verify the correct manager is returning
+    if (goal.period_type && goal.period_type !== 'full_quarter' && goal.transition_id) {
+      const transitionResult = await query(
+        'SELECT old_manager_id, new_manager_id FROM employee_quarter_transitions WHERE id = $1',
+        [goal.transition_id]
+      );
+      
+      if (transitionResult.rows.length > 0) {
+        const transition = transitionResult.rows[0];
+        
+        // For pre-transition goals, only old manager can return
+        if (goal.period_type === 'pre_transition') {
+          if (currentUserId !== transition.old_manager_id) {
+            return res.status(403).json({ 
+              error: 'Only the pre-transition manager can return pre-transition goals' 
+            });
+          }
+        }
+        // For post-transition goals, only new manager can return
+        else if (goal.period_type === 'post_transition') {
+          if (currentUserId !== transition.new_manager_id) {
+            return res.status(403).json({ 
+              error: 'Only the post-transition manager can return post-transition goals' 
+            });
+          }
+        }
+      }
+    }
+    
+    // Check if user is manager or delegate (includes transition checks)
     const auth = await checkManagerOrDelegate(
       req.user.userId,
       goal.employee_id,

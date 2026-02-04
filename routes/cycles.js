@@ -34,7 +34,15 @@ router.get('/active', authMiddleware, async (req, res) => {
     const cycle = cycleResult.rows[0] || null;
 
     if (!cycle) {
-      return res.json({ data: null, quarterly_cycles: [], goals_quarterly_cycles: [], dashboard: null });
+      return res.json({ 
+        data: null, 
+        quarterly_cycles: [], 
+        goals_quarterly_cycles: [], 
+        dashboard: null,
+        goal_setting: { quarter: null, present_quarter: null, enabled: false },
+        self_review: { review_for_quarter: null, present_quarter: null, enabled: false },
+        manager_review: { review_for_quarter: null, present_quarter: null, enabled: false }
+      });
     }
 
     // Get quarterly cycles data (always fetch)
@@ -67,6 +75,84 @@ router.get('/active', authMiddleware, async (req, res) => {
       [cycle.id]
     );
 
+    // Calculate current quarter and feature availability
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    // Get local date string (YYYY-MM-DD) to avoid timezone issues
+    const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    
+    // Determine current quarter based on actual quarter dates from quarterly_cycles table
+    // Find which quarter's date range contains today's date
+    let currentQuarter = null;
+    for (const qc of quarterlyCyclesResult.rows) {
+      if (qc.quarter_start_date && qc.quarter_end_date) {
+        const qStart = new Date(qc.quarter_start_date);
+        const qEnd = new Date(qc.quarter_end_date);
+        qStart.setHours(0, 0, 0, 0);
+        qEnd.setHours(23, 59, 59, 999);
+        if (today >= qStart && today <= qEnd) {
+          currentQuarter = qc.quarter;
+          break;
+        }
+      }
+    }
+    
+    // If no quarter found (fallback to month-based calculation)
+    if (!currentQuarter) {
+      const month = today.getMonth() + 1; // 1-12
+      if (month >= 1 && month <= 3) currentQuarter = 1;
+      else if (month >= 4 && month <= 6) currentQuarter = 2;
+      else if (month >= 7 && month <= 9) currentQuarter = 3;
+      else currentQuarter = 4;
+    }
+    
+    // Calculate review quarter (previous quarter)
+    // Q1 reviews Q4 (previous year), Q2 reviews Q1, Q3 reviews Q2, Q4 reviews Q3
+    let reviewForQuarter = currentQuarter - 1;
+    if (reviewForQuarter < 1) {
+      reviewForQuarter = 4; // Q1 reviews Q4 of previous year
+    }
+    
+    // Helper function to check if date is within range
+    // Compares dates as strings (YYYY-MM-DD) to avoid timezone issues
+    const isDateInRange = (dateStr, startStr, endStr) => {
+      if (!dateStr || !startStr || !endStr) return false;
+      
+      // Normalize date strings to YYYY-MM-DD format
+      const normalizeDate = (dateValue) => {
+        if (typeof dateValue === 'string') {
+          // If it's already in YYYY-MM-DD format, return as is
+          if (/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
+            return dateValue;
+          }
+          // Otherwise parse and format
+          const d = new Date(dateValue);
+          if (isNaN(d.getTime())) return null;
+          const year = d.getFullYear();
+          const month = String(d.getMonth() + 1).padStart(2, '0');
+          const day = String(d.getDate()).padStart(2, '0');
+          return `${year}-${month}-${day}`;
+        }
+        // If it's a Date object, format it
+        if (dateValue instanceof Date) {
+          const year = dateValue.getFullYear();
+          const month = String(dateValue.getMonth() + 1).padStart(2, '0');
+          const day = String(dateValue.getDate()).padStart(2, '0');
+          return `${year}-${month}-${day}`;
+        }
+        return null;
+      };
+      
+      const normalizedDate = normalizeDate(dateStr);
+      const normalizedStart = normalizeDate(startStr);
+      const normalizedEnd = normalizeDate(endStr);
+      
+      if (!normalizedDate || !normalizedStart || !normalizedEnd) return false;
+      
+      // Compare as strings (YYYY-MM-DD format allows string comparison)
+      return normalizedDate >= normalizedStart && normalizedDate <= normalizedEnd;
+    };
+
     // Get current user's employee record (need both id and emp_code)
     const employeeResult = await query(
       'SELECT id, emp_code FROM employees WHERE profile_id = $1',
@@ -75,19 +161,76 @@ router.get('/active', authMiddleware, async (req, res) => {
     const managerId = employeeResult.rows[0]?.id;
     const managerCode = employeeResult.rows[0]?.emp_code;
 
+    // Calculate feature availability
+    // Find goals quarterly cycle for current quarter
+    const currentGoalsCycle = goalsQuarterlyCyclesResult.rows.find(gqc => gqc.quarter === currentQuarter);
+    const goalSettingEnabled = currentGoalsCycle && 
+      isDateInRange(
+        todayStr,
+        currentGoalsCycle.goal_submission_start_date,
+        currentGoalsCycle.goal_submission_end_date
+      );
+    
+    // Find quarterly cycle for review quarter (previous quarter)
+    const reviewQuarterlyCycle = quarterlyCyclesResult.rows.find(qc => qc.quarter === reviewForQuarter);
+    const selfReviewEnabled = reviewQuarterlyCycle && 
+      reviewQuarterlyCycle.self_review_start_date && 
+      reviewQuarterlyCycle.self_review_end_date &&
+      isDateInRange(
+        todayStr,
+        reviewQuarterlyCycle.self_review_start_date,
+        reviewQuarterlyCycle.self_review_end_date
+      );
+    
+    const managerReviewEnabled = reviewQuarterlyCycle && 
+      reviewQuarterlyCycle.quarterly_manager_review_start_date && 
+      reviewQuarterlyCycle.quarterly_manager_review_end_date &&
+      isDateInRange(
+        todayStr,
+        reviewQuarterlyCycle.quarterly_manager_review_start_date,
+        reviewQuarterlyCycle.quarterly_manager_review_end_date
+      );
+
     if (!managerId || !managerCode) {
       return res.json({ 
         data: cycle, 
         quarterly_cycles: quarterlyCyclesResult.rows,
         goals_quarterly_cycles: goalsQuarterlyCyclesResult.rows,
-        dashboard: null 
+        dashboard: null,
+        goal_setting: {
+          quarter: currentQuarter,
+          present_quarter: currentQuarter,
+          enabled: !!goalSettingEnabled
+        },
+        self_review: {
+          review_for_quarter: reviewForQuarter,
+          present_quarter: currentQuarter,
+          enabled: !!selfReviewEnabled
+        },
+        manager_review: {
+          review_for_quarter: reviewForQuarter,
+          present_quarter: currentQuarter,
+          enabled: !!managerReviewEnabled
+        }
       });
     }
 
     // Get direct reports (manager_code stores emp_code value)
+    // Include employees with active transitions where this manager is the new manager
     const directReportsResult = await query(
-      "SELECT id FROM employees WHERE manager_code = $1 AND status = 'active'",
-      [managerCode]
+      `SELECT DISTINCT e.id
+       FROM employees e
+       WHERE e.status = 'active'
+         AND (
+           e.manager_code = $1
+           OR EXISTS (
+             SELECT 1 FROM employee_quarter_transitions eqt
+             WHERE eqt.employee_id = e.id
+               AND eqt.new_manager_id = $2
+               AND eqt.transition_date <= CURRENT_DATE
+           )
+         )`,
+      [managerCode, managerId]
     );
     const directReportIds = directReportsResult.rows.map(r => r.id);
     const directReportsCount = directReportIds.length;
@@ -118,6 +261,21 @@ router.get('/active', authMiddleware, async (req, res) => {
           quarterly_pending: 0,
           year_end_pending: 0,
           quarterly_open_pending: 0,
+        },
+        goal_setting: {
+          quarter: currentQuarter,
+          present_quarter: currentQuarter,
+          enabled: !!goalSettingEnabled
+        },
+        self_review: {
+          review_for_quarter: reviewForQuarter,
+          present_quarter: currentQuarter,
+          enabled: !!selfReviewEnabled
+        },
+        manager_review: {
+          review_for_quarter: reviewForQuarter,
+          present_quarter: currentQuarter,
+          enabled: !!managerReviewEnabled
         }
       });
     }
@@ -174,8 +332,7 @@ router.get('/active', authMiddleware, async (req, res) => {
     // Calculate quarterly pending counts
     let quarterlyPending = 0;
     let quarterlyOpenPending = 0;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // Note: 'today' is already defined above
 
     quarterlySelfEvalsResult.rows.forEach(se => {
       const key = `${se.employee_id}_${se.quarter}`;
@@ -235,7 +392,8 @@ router.get('/active', authMiddleware, async (req, res) => {
       }
     });
 
-    res.json({
+    // Build new response format (feature availability already calculated above)
+    const response = {
       data: cycle,
       quarterly_cycles: quarterlyCyclesResult.rows,
       goals_quarterly_cycles: goalsQuarterlyCyclesResult.rows,
@@ -247,8 +405,25 @@ router.get('/active', authMiddleware, async (req, res) => {
         quarterly_pending: quarterlyPending,
         year_end_pending: yearEndPending,
         quarterly_open_pending: quarterlyOpenPending,
+      },
+      goal_setting: {
+        quarter: currentQuarter,
+        present_quarter: currentQuarter,
+        enabled: !!goalSettingEnabled
+      },
+      self_review: {
+        review_for_quarter: reviewForQuarter,
+        present_quarter: currentQuarter,
+        enabled: !!selfReviewEnabled
+      },
+      manager_review: {
+        review_for_quarter: reviewForQuarter,
+        present_quarter: currentQuarter,
+        enabled: !!managerReviewEnabled
       }
-    });
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Get active cycle error:', error);
     res.status(500).json({ error: error.message });
@@ -314,9 +489,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Request body is required and must not be empty' });
     }
 
-    // Whitelist of allowed fields that can be updated
-    // Note: manager_evaluation_start/end, self_evaluation_start/end, goal_submission_* removed
-    // These are now stored in quarterly_cycles and goals_quarterly_cycles tables
+
     const allowedFields = [
       'name',
       'description',
@@ -584,58 +757,57 @@ router.put('/:id/quarterly-cycles/:quarter', authMiddleware, requireRole(['hr_ad
       finalManagerReviewStart = finalManagerReviewEnd;
     }
     
-    // If only quarter dates are being updated, check if review dates would violate constraints
-    // and reset them if necessary
-    if ((fieldsToUpdate.quarter_start_date || fieldsToUpdate.quarter_end_date) && 
-        !fieldsToUpdate.self_review_start_date && !fieldsToUpdate.self_review_end_date &&
-        !fieldsToUpdate.manager_review_start_date && !fieldsToUpdate.manager_review_end_date) {
-      const qEnd = new Date(finalQuarterEnd);
+    // Removed: No longer clamping review dates when quarter dates are updated
+    // Review dates can be set outside quarter range for reviewing previous quarters
+    
+    // Validation removed: Employee review and manager review dates no longer need to be within quarter range
+    // They can be set for reviewing previous quarters (e.g., Q2 reviews Q1 performance)
+
+    // Validation: Quarter end date must be before next quarter start date
+    const validationErrors = [];
+    if (quarter < 4) {
+      // Check if next quarter exists and has a start date
+      const nextQuarterResult = await query(
+        'SELECT quarter_start_date FROM quarterly_cycles WHERE performance_cycle_id = $1 AND quarter = $2',
+        [id, quarter + 1]
+      );
       
-      // Clear self review dates if they're outside the new quarter range (nullable columns)
-      if (finalSelfReviewStart && new Date(finalSelfReviewStart) > qEnd) {
-        finalSelfReviewStart = null;
-      }
-      if (finalSelfReviewEnd && new Date(finalSelfReviewEnd) > qEnd) {
-        finalSelfReviewEnd = null;
-      }
-      
-      // For manager review dates, clamp them to quarter end date if needed (NOT NULL columns)
-      if (new Date(finalManagerReviewStart) > qEnd) {
-        finalManagerReviewStart = finalQuarterEnd;
-      }
-      if (new Date(finalManagerReviewEnd) > qEnd) {
-        finalManagerReviewEnd = finalQuarterEnd;
-      }
-      
-      // Re-check manager review dates constraint after clamping
-      if (new Date(finalManagerReviewStart) > new Date(finalManagerReviewEnd)) {
-        finalManagerReviewStart = finalManagerReviewEnd;
+      if (nextQuarterResult.rows.length > 0 && nextQuarterResult.rows[0].quarter_start_date) {
+        const nextQuarterStart = new Date(nextQuarterResult.rows[0].quarter_start_date);
+        const currentQuarterEnd = new Date(finalQuarterEnd);
+        nextQuarterStart.setHours(0, 0, 0, 0);
+        currentQuarterEnd.setHours(23, 59, 59, 999);
+        
+        if (currentQuarterEnd >= nextQuarterStart) {
+          validationErrors.push(`Quarter ${quarter} end date (${finalQuarterEnd}) must be before Quarter ${quarter + 1} start date (${nextQuarterResult.rows[0].quarter_start_date})`);
+        }
       }
     }
     
-    // Validate all dates are within quarter range
-    const qStart = new Date(finalQuarterStart);
-    const qEnd = new Date(finalQuarterEnd);
-    qStart.setHours(0, 0, 0, 0);
-    qEnd.setHours(23, 59, 59, 999);
-    
-    const dateValidations = [
-      { date: finalSelfReviewStart, label: 'Employee Review Start' },
-      { date: finalSelfReviewEnd, label: 'Employee Review End' },
-      { date: finalManagerReviewStart, label: 'Manager Review Start' },
-      { date: finalManagerReviewEnd, label: 'Manager Review End' },
-    ];
-    
-    for (const { date, label } of dateValidations) {
-      if (date) {
-        const d = new Date(date);
-        if (d < qStart || d > qEnd) {
-          return res.status(400).json({ 
-            error: 'Date out of range',
-            message: `${label} (${date}) must be between Quarter Start (${finalQuarterStart}) and Quarter End (${finalQuarterEnd}).`
-          });
+    // Validation: Current quarter start date must be after previous quarter end date
+    if (quarter > 1) {
+      const prevQuarterResult = await query(
+        'SELECT quarter_end_date FROM quarterly_cycles WHERE performance_cycle_id = $1 AND quarter = $2',
+        [id, quarter - 1]
+      );
+      
+      if (prevQuarterResult.rows.length > 0 && prevQuarterResult.rows[0].quarter_end_date) {
+        const prevQuarterEnd = new Date(prevQuarterResult.rows[0].quarter_end_date);
+        const currentQuarterStart = new Date(finalQuarterStart);
+        prevQuarterEnd.setHours(23, 59, 59, 999);
+        currentQuarterStart.setHours(0, 0, 0, 0);
+        
+        if (prevQuarterEnd >= currentQuarterStart) {
+          validationErrors.push(`Quarter ${quarter} start date (${finalQuarterStart}) must be after Quarter ${quarter - 1} end date (${prevQuarterResult.rows[0].quarter_end_date})`);
         }
       }
+    }
+    
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: 'Date validation failed',
+        details: validationErrors
+      });
     }
 
     // Use a single UPSERT with all final values
@@ -863,7 +1035,8 @@ router.put('/:id/goals-quarterly-cycles/:quarter', authMiddleware, requireRole([
       quarterlyEndDate = qcResult.rows[0].quarter_end_date;
     }
     
-    // Validate that goal and manager review dates are within quarterly date range
+    // Validate that goal submission dates are within quarterly date range
+    // Manager review dates validation removed - they can be set for reviewing previous quarters
     const validationErrors = [];
     
     if (fieldsToUpdate.goal_submission_start_date && quarterlyStartDate && quarterlyEndDate) {
@@ -880,17 +1053,39 @@ router.put('/:id/goals-quarterly-cycles/:quarter', authMiddleware, requireRole([
       }
     }
     
-    if (fieldsToUpdate.manager_review_start_date && quarterlyStartDate && quarterlyEndDate) {
-      if (new Date(fieldsToUpdate.manager_review_start_date) < new Date(quarterlyStartDate) ||
-          new Date(fieldsToUpdate.manager_review_start_date) > new Date(quarterlyEndDate)) {
-        validationErrors.push(`manager_review_start_date (${fieldsToUpdate.manager_review_start_date}) must be between quarter_start_date (${quarterlyStartDate}) and quarter_end_date (${quarterlyEndDate})`);
-      }
-    }
+    // Get existing goals quarterly cycle to merge with updates for validation
+    const existingGoalsResult = await query(
+      'SELECT * FROM goals_quarterly_cycles WHERE performance_cycle_id = $1 AND quarter = $2',
+      [id, quarter]
+    );
+    const existingGoals = existingGoalsResult.rows[0] || {};
     
-    if (fieldsToUpdate.manager_review_end_date && quarterlyStartDate && quarterlyEndDate) {
-      if (new Date(fieldsToUpdate.manager_review_end_date) < new Date(quarterlyStartDate) ||
-          new Date(fieldsToUpdate.manager_review_end_date) > new Date(quarterlyEndDate)) {
-        validationErrors.push(`manager_review_end_date (${fieldsToUpdate.manager_review_end_date}) must be between quarter_start_date (${quarterlyStartDate}) and quarter_end_date (${quarterlyEndDate})`);
+    // Merge existing values with updates for validation
+    const finalGoalSubmissionStart = fieldsToUpdate.goal_submission_start_date || existingGoals.goal_submission_start_date;
+    const finalGoalSubmissionEnd = fieldsToUpdate.goal_submission_end_date || existingGoals.goal_submission_end_date;
+    const finalManagerReviewStart = fieldsToUpdate.manager_review_start_date || existingGoals.manager_review_start_date;
+    
+    // Validation: Manager Goal Review Start Date must be:
+    // 1. Between goal submission start date and goal submission end date
+    // 2. Between quarter start date and quarter end date
+    if (finalManagerReviewStart && quarterlyStartDate && quarterlyEndDate) {
+      const managerReviewStartDate = new Date(finalManagerReviewStart);
+      const quarterStart = new Date(quarterlyStartDate);
+      const quarterEnd = new Date(quarterlyEndDate);
+      
+      // Check if manager review start is between quarter dates
+      if (managerReviewStartDate < quarterStart || managerReviewStartDate > quarterEnd) {
+        validationErrors.push(`manager_review_start_date (${finalManagerReviewStart}) must be between quarter_start_date (${quarterlyStartDate}) and quarter_end_date (${quarterlyEndDate})`);
+      }
+      
+      // Check if manager review start is between goal submission dates
+      if (finalGoalSubmissionStart && finalGoalSubmissionEnd) {
+        const goalSubmissionStart = new Date(finalGoalSubmissionStart);
+        const goalSubmissionEnd = new Date(finalGoalSubmissionEnd);
+        
+        if (managerReviewStartDate < goalSubmissionStart || managerReviewStartDate > goalSubmissionEnd) {
+          validationErrors.push(`manager_review_start_date (${finalManagerReviewStart}) must be between goal_submission_start_date (${finalGoalSubmissionStart}) and goal_submission_end_date (${finalGoalSubmissionEnd})`);
+        }
       }
     }
     

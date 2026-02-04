@@ -7,10 +7,128 @@ import { query } from '../config/database.js';
  */
 
 /**
+ * Check if employee with transition can perform actions (within quarter dates only)
+ * Returns true if employee has transition AND current date is within quarter date range
+ */
+export async function canPerformTransitionActions(employeeId, cycleId, quarter) {
+  // Check if employee has active transition
+  const hasTransition = await hasActiveTransition(employeeId, cycleId, quarter);
+  if (!hasTransition) {
+    return false;
+  }
+  
+  // Get quarter date range
+  const quarterRange = await getQuarterDateRange(cycleId, quarter);
+  if (!quarterRange || !quarterRange.startDate || !quarterRange.endDate) {
+    return false;
+  }
+  
+  // Check if current date is within quarter dates
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const quarterStart = new Date(quarterRange.startDate);
+  quarterStart.setHours(0, 0, 0, 0);
+  const quarterEnd = new Date(quarterRange.endDate);
+  quarterEnd.setHours(23, 59, 59, 999);
+  
+  return now >= quarterStart && now <= quarterEnd;
+}
+
+/**
+ * Determine manager role for a transition
+ * Uses manager_history table to get accurate manager information
+ * Returns: 'old_manager', 'new_manager', 'same_manager', or null
+ */
+export async function getManagerRoleForTransition(managerId, employeeId, cycleId, quarter) {
+  try {
+    if (!managerId || !employeeId || !cycleId || !quarter) {
+      return null;
+    }
+
+    // Get transition for this employee/cycle/quarter
+    const transitionResult = await query(
+      `SELECT id, transition_date, old_manager_id, new_manager_id
+       FROM employee_quarter_transitions
+       WHERE employee_id = $1
+         AND cycle_id = $2
+         AND quarter = $3`,
+      [employeeId, cycleId, quarter]
+    );
+
+    if (transitionResult.rows.length === 0) {
+      return null; // No transition
+    }
+
+    const transition = transitionResult.rows[0];
+    
+    // Get manager history entry for this transition
+    // Use direct transition_id link (more reliable than date matching)
+    const managerHistoryResult = await query(
+      `SELECT old_manager_id, new_manager_id
+       FROM manager_history
+       WHERE transition_id = $1
+       LIMIT 1`,
+      [transition.id]
+    );
+
+    let oldManagerId = transition.old_manager_id;
+    let newManagerId = transition.new_manager_id;
+
+    // If manager_history has the record, use it (more accurate - not affected by employees.manager_code updates)
+    if (managerHistoryResult.rows.length > 0) {
+      const history = managerHistoryResult.rows[0];
+      oldManagerId = history.old_manager_id;
+      newManagerId = history.new_manager_id;
+    }
+
+    // If new_manager_id is null or empty, it is considered as the same manager
+    const isNewManagerIdEmpty = !newManagerId || newManagerId === '';
+    
+    const isOldManager = oldManagerId && oldManagerId === managerId;
+    const isNewManager = newManagerId && newManagerId === managerId;
+    
+    // If new_manager_id is null/empty, treat as same manager
+    if (isNewManagerIdEmpty) {
+      if (isOldManager) {
+        return 'same_manager'; // Manager didn't change, so it's the same manager
+      } else {
+        return null; // Not involved in this transition
+      }
+    }
+    
+    const managersAreDifferent = newManagerId && 
+                                  newManagerId !== oldManagerId;
+
+    if (managersAreDifferent) {
+      // Different managers
+      if (isOldManager) {
+        return 'old_manager';
+      } else if (isNewManager) {
+        return 'new_manager';
+      } else {
+        return null; // Not involved in this transition
+      }
+    } else {
+      // Same manager (new_manager_id equals old_manager_id)
+      if (isOldManager || isNewManager) {
+        return 'same_manager';
+      } else {
+        return null; // Not involved in this transition
+      }
+    }
+  } catch (error) {
+    console.error('Error determining manager role for transition:', error);
+    return null;
+  }
+}
+
+/**
  * Get quarter date range from cycle
  */
 async function getQuarterDateRange(cycleId, quarter) {
-  // Try quarterly_cycles table first (if it exists)
+  // Get quarter dates from quarterly_cycles table
+  // Note: quarterly_start_date/quarterly_end_date were removed from goals_quarterly_cycles
+  // Dates are now stored in quarterly_cycles as quarter_start_date/quarter_end_date
   let cycleResult = await query(
     `SELECT quarter_start_date, quarter_end_date 
      FROM quarterly_cycles 
@@ -18,17 +136,7 @@ async function getQuarterDateRange(cycleId, quarter) {
     [cycleId, quarter]
   );
   
-  // If quarterly_cycles doesn't have the data, try goals_quarterly_cycles
-  if (cycleResult.rows.length === 0) {
-    cycleResult = await query(
-      `SELECT quarterly_start_date as quarter_start_date, quarterly_end_date as quarter_end_date 
-       FROM goals_quarterly_cycles 
-       WHERE performance_cycle_id = $1 AND quarter = $2`,
-      [cycleId, quarter]
-    );
-  }
-  
-  // If still no data, calculate from performance_cycles year (fallback)
+  // If no data in quarterly_cycles, calculate from performance_cycles year (fallback)
   if (cycleResult.rows.length === 0) {
     const yearResult = await query(
       `SELECT year FROM performance_cycles WHERE id = $1`,
@@ -147,8 +255,8 @@ export async function createTransition(employeeId, cycleId, quarter, transitionD
     ? null 
     : new_manager_id;
   
-  // Validate transition date
-  const { startDate, endDate } = await validateTransitionDate(cycleId, quarter, transition_date);
+  // Get quarter date range (validation removed - transition date can be outside quarter range)
+  const { startDate, endDate } = await getQuarterDateRange(cycleId, quarter);
   
   // Get current employee details
   const employee = await getEmployeeDetails(employeeId);
@@ -167,51 +275,127 @@ export async function createTransition(employeeId, cycleId, quarter, transitionD
     newManagerCode = newManager.emp_code;
   }
   
-  // Check if transition already exists
+  // Calculate period dates
+  const transitionDate = new Date(transition_date);
+  const preStartDate = startDate;
+  const preEndDate = transitionDate; // Pre-transition ends on the transition date itself
+  const postStartDate = transitionDate; // Post-transition starts on the transition date itself
+  const postEndDate = endDate;
+  
+  // Check if transition already exists to determine if we're updating
   const existing = await query(
     'SELECT id FROM employee_quarter_transitions WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3',
     [employeeId, cycleId, quarter]
   );
   
-  if (existing.rows.length > 0) {
-    throw new Error(`Transition already exists for employee ${employeeId} in cycle ${cycleId}, quarter ${quarter}`);
-  }
+  const isUpdate = existing.rows.length > 0;
+  const existingTransitionId = isUpdate ? existing.rows[0].id : null;
   
-  // Calculate period dates
-  const transitionDate = new Date(transition_date);
-  const preStartDate = startDate;
-  const preEndDate = new Date(transitionDate);
-  preEndDate.setDate(preEndDate.getDate() - 1); // Day before transition
-  const postStartDate = transitionDate;
-  const postEndDate = endDate;
-  
-  // Create transition record
+  // Upsert transition record (insert or update if exists)
   let result;
   try {
-    result = await query(
-      `INSERT INTO employee_quarter_transitions (
-        employee_id, cycle_id, quarter, transition_type, transition_date,
-        old_manager_id, new_manager_id, old_department, new_department,
-        old_project, new_project, old_grade, new_grade, created_by
-      ) VALUES ($1, $2, $3, $4::transition_type, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-      RETURNING *`,
-      [
-        employeeId,
-        cycleId,
-        quarter,
-        transition_type,
-        transition_date,
-        currentManager.managerId,
-        finalNewManagerId,
-        employee.department,
-        new_department || employee.department,
-        null, // old_project (not tracked currently)
-        new_project,
-        employee.grade,
-        new_grade || employee.grade,
-        createdBy
-      ]
-    );
+    if (isUpdate) {
+      // Update existing transition
+      result = await query(
+        `UPDATE employee_quarter_transitions SET
+          transition_type = $1::transition_type,
+          transition_date = $2,
+          old_manager_id = $3,
+          new_manager_id = $4,
+          old_department = $5,
+          new_department = $6,
+          old_project = $7,
+          new_project = $8,
+          old_grade = $9,
+          new_grade = $10,
+          updated_at = NOW()
+        WHERE employee_id = $11 AND cycle_id = $12 AND quarter = $13
+        RETURNING *`,
+        [
+          transition_type,
+          transition_date,
+          currentManager.managerId,
+          finalNewManagerId,
+          employee.department,
+          new_department || employee.department,
+          null, // old_project (not tracked currently)
+          new_project,
+          employee.grade,
+          new_grade || employee.grade,
+          employeeId,
+          cycleId,
+          quarter
+        ]
+      );
+    } else {
+      // Insert new transition
+      result = await query(
+        `INSERT INTO employee_quarter_transitions (
+          employee_id, cycle_id, quarter, transition_type, transition_date,
+          old_manager_id, new_manager_id, old_department, new_department,
+          old_project, new_project, old_grade, new_grade, created_by
+        ) VALUES ($1, $2, $3, $4::transition_type, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        RETURNING *`,
+        [
+          employeeId,
+          cycleId,
+          quarter,
+          transition_type,
+          transition_date,
+          currentManager.managerId,
+          finalNewManagerId,
+          employee.department,
+          new_department || employee.department,
+          null, // old_project (not tracked currently)
+          new_project,
+          employee.grade,
+          new_grade || employee.grade,
+          createdBy
+        ]
+      );
+    }
+    
+    if (!result.rows || result.rows.length === 0) {
+      throw new Error(`Failed to ${isUpdate ? 'update' : 'create'} transition - no data returned`);
+    }
+    
+    const transition = result.rows[0];
+    
+    // Insert into manager_history table to track manager changes
+    // This ensures we have historical record even if employees.manager_code is updated later
+    // Directly link to transition via transition_id for proper relationship
+    // Only insert if manager actually changed (old_manager_id !== new_manager_id)
+    if (currentManager.managerId !== finalNewManagerId) {
+      try {
+        await query(
+          `INSERT INTO manager_history (
+            employee_id, old_manager_id, new_manager_id, effective_date, changed_by, transition_id
+          ) VALUES ($1, $2, $3, $4, $5, $6)
+          ON CONFLICT DO NOTHING`,
+          [
+            employeeId,
+            currentManager.managerId,
+            finalNewManagerId,
+            transition_date,
+            createdBy,
+            transition.id  // Direct link to transition
+          ]
+        );
+        console.log(`Manager history recorded for employee ${employeeId} on ${transition_date} linked to transition ${transition.id}`);
+      } catch (historyError) {
+        // Log but don't fail the transition creation if history insert fails
+        console.error('Error inserting into manager_history:', historyError);
+        // Check if it's a unique constraint violation (already exists) - that's okay
+        if (!historyError.message || !historyError.message.includes('unique')) {
+          console.warn('Manager history not recorded, but transition created successfully');
+        }
+      }
+    }
+    
+    // Close old period goals (always update to ensure goals are properly marked)
+    await closeOldPeriodGoals(employeeId, cycleId, quarter, transition.id);
+    
+    return transition;
   } catch (error) {
     // Provide more helpful error message
     if (error.message && error.message.includes('does not exist')) {
@@ -219,17 +403,6 @@ export async function createTransition(employeeId, cycleId, quarter, transitionD
     }
     throw error;
   }
-  
-  if (!result.rows || result.rows.length === 0) {
-    throw new Error('Failed to create transition - no data returned');
-  }
-  
-  const transition = result.rows[0];
-  
-  // Close old period goals
-  await closeOldPeriodGoals(employeeId, cycleId, quarter, transition.id);
-  
-  return transition;
 }
 
 /**
@@ -248,37 +421,33 @@ async function closeOldPeriodGoals(employeeId, cycleId, quarter, transitionId) {
   
   const transitionDate = transitionResult.rows[0].transition_date;
   
-  // Get quarter start and end dates from goals_quarterly_cycles
+  // Get quarter start and end dates from quarterly_cycles table
+  // Note: quarterly_start_date/quarterly_end_date were removed from goals_quarterly_cycles
+  // Dates are now stored in quarterly_cycles as quarter_start_date/quarter_end_date
   const quarterRangeResult = await query(
-    `SELECT quarterly_start_date, quarterly_end_date 
-     FROM goals_quarterly_cycles 
+    `SELECT quarter_start_date, quarter_end_date 
+     FROM quarterly_cycles 
      WHERE performance_cycle_id = $1 AND quarter = $2`,
     [cycleId, quarter]
   );
   
   let periodStartDate = transitionDate; // Fallback to transition date
-  let periodEndDate = new Date(transitionDate);
-  periodEndDate.setDate(periodEndDate.getDate() - 1); // Day before transition
+  let periodEndDate = transitionDate; // Pre-transition ends on the transition date itself
   
   if (quarterRangeResult.rows.length > 0) {
-    periodStartDate = quarterRangeResult.rows[0].quarterly_start_date;
-  } else {
-    // Fallback: try quarterly_cycles table
-    const altQuarterRangeResult = await query(
-      `SELECT quarter_start_date as quarterly_start_date, quarter_end_date as quarterly_end_date 
-       FROM quarterly_cycles 
-       WHERE performance_cycle_id = $1 AND quarter = $2`,
-      [cycleId, quarter]
-    );
-    if (altQuarterRangeResult.rows.length > 0) {
-      periodStartDate = altQuarterRangeResult.rows[0].quarterly_start_date;
-    }
+    periodStartDate = quarterRangeResult.rows[0].quarter_start_date;
   }
   
-  const periodStartDateStr = periodStartDate instanceof Date 
-    ? periodStartDate.toISOString().split('T')[0] 
-    : new Date(periodStartDate).toISOString().split('T')[0];
-  const periodEndDateStr = periodEndDate.toISOString().split('T')[0];
+  // Ensure both dates are Date objects before calling toISOString
+  const periodStartDateObj = periodStartDate instanceof Date 
+    ? periodStartDate 
+    : new Date(periodStartDate);
+  const periodEndDateObj = periodEndDate instanceof Date 
+    ? periodEndDate 
+    : new Date(periodEndDate);
+  
+  const periodStartDateStr = periodStartDateObj.toISOString().split('T')[0];
+  const periodEndDateStr = periodEndDateObj.toISOString().split('T')[0];
   
   // Calculate transition date time (end of transition date) for comparison
   // Use <= to include goals/KRAs created on the transition date (they are still pre-transition)
@@ -477,9 +646,12 @@ export async function getTransitionById(transitionId) {
 export async function getEmployeeTransitions(employeeId, cycleId = null, quarter = null) {
   let sql = `
     SELECT t.*, 
+           e.full_name as name,
+           e.emp_code,
            e1.full_name as old_manager_name,
            e2.full_name as new_manager_name
     FROM employee_quarter_transitions t
+    LEFT JOIN employees e ON t.employee_id = e.id
     LEFT JOIN employees e1 ON t.old_manager_id = e1.id
     LEFT JOIN employees e2 ON t.new_manager_id = e2.id
     WHERE t.employee_id = $1
@@ -570,4 +742,17 @@ export async function getTransitionForQuarter(employeeId, cycleId, quarter) {
   );
   
   return result.rows[0] || null;
+}
+
+/**
+ * Check if employee has an active transition for the given cycle and quarter
+ * This is used to bypass date validations for transitions
+ */
+export async function hasActiveTransition(employeeId, cycleId, quarter) {
+  const result = await query(
+    'SELECT id FROM employee_quarter_transitions WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3',
+    [employeeId, cycleId, quarter]
+  );
+  
+  return result.rows.length > 0;
 }

@@ -24,6 +24,30 @@ import { query } from '../config/database.js';
  */
 
 /**
+ * Check if calibration is enabled in calibration_settings
+ * @returns {Promise<boolean>} True if calibration is enabled, false otherwise
+ */
+export async function isCalibrationEnabled() {
+  try {
+    const result = await query(
+      'SELECT is_enabled FROM calibration_settings ORDER BY created_at DESC LIMIT 1'
+    );
+    
+    if (result.rows.length === 0) {
+      // If no settings exist, default to enabled (backward compatibility)
+      console.warn('No calibration_settings found, defaulting to enabled');
+      return true;
+    }
+    
+    return result.rows[0].is_enabled === true;
+  } catch (error) {
+    console.error('Error checking calibration settings:', error);
+    // On error, default to enabled (backward compatibility)
+    return true;
+  }
+}
+
+/**
  * Fetch calibration quotas from database
  * @returns {Promise<Object>} Quotas object with rating -> percentage mapping
  */
@@ -166,6 +190,19 @@ function calibrateGroup(employees, quotas) {
  */
 export async function applyCalibration(quarter, cycleId, hrUserId) {
   try {
+    // Step 0: Check if calibration is enabled
+    const calibrationEnabled = await isCalibrationEnabled();
+    if (!calibrationEnabled) {
+      console.log('Calibration is disabled in calibration_settings. Skipping calibration.');
+      return {
+        processed: 0,
+        skipped: 0,
+        message: 'Calibration is disabled. No calibration applied.',
+        distribution: undefined,
+        calibration_disabled: true
+      };
+    }
+    
     // Step 1: Fetch calibration quotas from database (configurable by HR/admin)
     const quotas = await fetchCalibrationQuotas();
     

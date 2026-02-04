@@ -26,6 +26,8 @@ router.get('/', authMiddleware, async (req, res) => {
     
     // Handle manager filter: manager_id is UUID, manager_code is emp_code string
     let managerCodeValue = manager_code;
+    let managerIdValue = manager_id;
+    
     if (manager_id && !manager_code) {
       // If manager_id is provided (UUID), look up the employee's emp_code
       const managerResult = await query(
@@ -34,15 +36,43 @@ router.get('/', authMiddleware, async (req, res) => {
       );
       if (managerResult.rows.length > 0) {
         managerCodeValue = managerResult.rows[0].emp_code;
+        managerIdValue = manager_id;
       } else {
         // Manager not found, return empty result
         return res.json({ data: [], count: 0, totalCount: 0 });
       }
+    } else if (manager_code && !manager_id) {
+      // If manager_code is provided, look up the manager's id for transition checks
+      const managerResult = await query(
+        'SELECT id FROM employees WHERE emp_code = $1',
+        [manager_code]
+      );
+      if (managerResult.rows.length > 0) {
+        managerIdValue = managerResult.rows[0].id;
+      }
     }
     
     if (managerCodeValue) {
-      whereClause += ` AND manager_code = $${paramIndex++}`;
-      params.push(managerCodeValue);
+      // Include employees where manager_code matches OR employees with active transitions
+      // where new_manager_id matches (for mid-quarter transitions)
+      // Only include transitions where transition_date has passed (post-transition period)
+      if (managerIdValue) {
+        whereClause += ` AND (
+          manager_code = $${paramIndex} 
+          OR EXISTS (
+            SELECT 1 FROM employee_quarter_transitions eqt
+            WHERE eqt.employee_id = employees.id
+              AND eqt.new_manager_id = $${paramIndex + 1}
+              AND eqt.transition_date <= CURRENT_DATE
+          )
+        )`;
+        params.push(managerCodeValue, managerIdValue);
+        paramIndex += 2;
+      } else {
+        // Fallback to just manager_code match if we can't find manager_id
+        whereClause += ` AND manager_code = $${paramIndex++}`;
+        params.push(managerCodeValue);
+      }
     }
 
     // Build the main query with window function for total count
@@ -302,11 +332,12 @@ router.get('/:id', authMiddleware, async (req, res) => {
 });
 
 // GET /api/employees/:id/team - Get direct reports
+// Includes employees with active transitions where this manager is the new manager
 router.get('/:id/team', authMiddleware, async (req, res) => {
   try {
-    // First, get the employee's emp_code (manager_code stores emp_code value)
+    // First, get the employee's emp_code and id (manager_code stores emp_code value)
     const empResult = await query(
-      'SELECT emp_code FROM employees WHERE id = $1',
+      'SELECT id, emp_code FROM employees WHERE id = $1',
       [req.params.id]
     );
     
@@ -315,11 +346,27 @@ router.get('/:id/team', authMiddleware, async (req, res) => {
     }
     
     const managerCode = empResult.rows[0].emp_code;
+    const managerId = empResult.rows[0].id;
     
+    // Get team members: employees where manager_code matches OR employees with active transitions
+    // where new_manager_id matches (for mid-quarter transitions)
+    // Only include transitions where transition_date has passed (post-transition period)
     const result = await query(
-      'SELECT * FROM employees WHERE manager_code = $1 ORDER BY full_name',
-      [managerCode]
+      `SELECT DISTINCT e.*
+       FROM employees e
+       WHERE (
+         e.manager_code = $1
+         OR EXISTS (
+           SELECT 1 FROM employee_quarter_transitions eqt
+           WHERE eqt.employee_id = e.id
+             AND eqt.new_manager_id = $2
+             AND eqt.transition_date <= CURRENT_DATE
+         )
+       )
+       ORDER BY e.full_name`,
+      [managerCode, managerId]
     );
+    
     res.json({ data: result.rows, count: result.rows.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -712,35 +759,68 @@ router.put('/:id/manager-review/admin-override', authMiddleware, requireRole(['h
       }
     }
     
-    // Upsert quarterly manager review with admin override
-    const reviewResult = await query(
-      `INSERT INTO quarterly_manager_reviews (id, employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, calculated_overall_rating, status, approved_at, admin_override, admin_override_by, admin_override_at, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, NOW(), NOW(), NOW())
-       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
-         reviewer_id = EXCLUDED.reviewer_id,
-         overall_comments = EXCLUDED.overall_comments,
-         guidance = EXCLUDED.guidance,
-         calculated_overall_rating = EXCLUDED.calculated_overall_rating,
-         status = EXCLUDED.status,
-         approved_at = CASE WHEN EXCLUDED.status = 'submitted' THEN NOW() ELSE quarterly_manager_reviews.approved_at END,
-         admin_override = true,
-         admin_override_by = EXCLUDED.admin_override_by,
-         admin_override_at = NOW(),
-         updated_at = NOW()
-       RETURNING *`,
-      [
-        employeeId,
-        cycle_id,
-        quarterNum,
-        reviewerEmployeeId,
-        overall_comments ?? null,
-        guidance ?? null,
-        calculated_overall_rating ?? null,
-        status || 'pending',
-        status === 'submitted' ? new Date() : null,
-        userId
-      ]
+    // For admin override, default to 'full_quarter' period_type if not provided
+    const periodType = req.body.period_type || 'full_quarter';
+    const transitionId = req.body.transition_id || null;
+    
+    // Check if a review already exists for this employee, cycle, quarter, and period
+    const existingReview = await query(
+      `SELECT id FROM quarterly_manager_reviews 
+       WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+         AND period_type = $4 
+         AND (COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid) = COALESCE($5, '00000000-0000-0000-0000-000000000000'::uuid))`,
+      [employeeId, cycle_id, quarterNum, periodType, transitionId]
     );
+    
+    let reviewResult;
+    if (existingReview.rows.length > 0) {
+      // Update existing review
+      reviewResult = await query(
+        `UPDATE quarterly_manager_reviews SET
+           reviewer_id = $1,
+           overall_comments = $2,
+           guidance = $3,
+           calculated_overall_rating = $4,
+           status = $5,
+           approved_at = CASE WHEN $5 = 'submitted' THEN NOW() ELSE approved_at END,
+           admin_override = true,
+           admin_override_by = $6,
+           admin_override_at = NOW(),
+           updated_at = NOW()
+         WHERE id = $7
+         RETURNING *`,
+        [
+          reviewerEmployeeId,
+          overall_comments ?? null,
+          guidance ?? null,
+          calculated_overall_rating ?? null,
+          status || 'pending',
+          userId,
+          existingReview.rows[0].id
+        ]
+      );
+    } else {
+      // Insert new review
+      reviewResult = await query(
+        `INSERT INTO quarterly_manager_reviews (id, employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, calculated_overall_rating, status, approved_at, admin_override, admin_override_by, admin_override_at, period_type, transition_id, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, NOW(), $11, $12, NOW(), NOW())
+         RETURNING *`,
+        [
+          employeeId,
+          cycle_id,
+          quarterNum,
+          reviewerEmployeeId,
+          overall_comments ?? null,
+          guidance ?? null,
+          calculated_overall_rating ?? null,
+          status || 'pending',
+          status === 'submitted' ? new Date() : null,
+          userId,
+          periodType,
+          transitionId
+        ]
+      );
+    }
     
     const managerReview = reviewResult.rows[0];
     
