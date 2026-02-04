@@ -48,17 +48,28 @@ router.get('/', authMiddleware, async (req, res) => {
       sql += ` AND period_type = $${idx++}::period_type`;
       params.push(period_type);
     }
+    // Apply transition_id filtering only for manager views (not for employee viewing own goals)
+    // When a manager views another employee's goals, we need to filter by transition_id
+    // When an employee views their own goals, they should see all their goals (pre + post + full_quarter)
+    const isManagerViewingOtherEmployee = managerId && employee_id && cycle_id && employee_id !== managerId;
+    
     if (transition_id) {
       sql += ` AND transition_id = $${idx++}`;
       params.push(transition_id);
-    } else {
-      // When transition_id is not provided, only return KRAs where transition_id IS NULL
+    } else if (isManagerViewingOtherEmployee) {
+      // When transition_id is not provided AND it's a manager viewing another employee,
+      // only return KRAs where transition_id IS NULL
       // This ensures we only get pre-transition and full_quarter KRAs (not post-transition)
       sql += ` AND transition_id IS NULL`;
     }
+    // If employee is viewing their own goals and transition_id is not provided, don't filter by transition_id
+    // This allows employees to see all their goals (pre + post + full_quarter)
 
-
-    if (managerId && employee_id && cycle_id && employee_id !== managerId) {
+    // Apply manager role filtering if viewing another employee's data
+    // If quarter is provided, filter for that specific quarter
+    // If quarter is not provided, check all quarters for transitions
+    // Note: If new_manager_id is null/empty, it is considered as the same manager
+    if (isManagerViewingOtherEmployee) {
       if (quarter) {
         // Quarter is provided - filter for this specific quarter
         const managerRole = await getManagerRoleForTransition(managerId, employee_id, cycle_id, parseInt(quarter));
@@ -307,11 +318,24 @@ router.put('/:id', authMiddleware, async (req, res) => {
               }
             }
             // For post-transition KRAs, only new manager can approve
+            // Note: If new_manager_id is null/empty, it is considered as the same manager
             else if (currentKra.period_type === 'post_transition') {
-              if (currentUserId !== transition.new_manager_id) {
-                return res.status(403).json({ 
-                  error: 'Only the post-transition manager can approve post-transition KRAs' 
-                });
+              console.log('transition.new_manager_id-', transition.new_manager_id);
+              // If new_manager_id is null/empty, it's the same manager, so old_manager can approve
+              if (transition.new_manager_id && transition.new_manager_id !== transition.old_manager_id) {
+                // Different managers - only new manager can approve post-transition
+                if (currentUserId !== transition.new_manager_id) {
+                  return res.status(403).json({ 
+                    error: 'Only the post-transition manager can approve post-transition KRAs' 
+                  });
+                }
+              } else {
+                // Same manager (new_manager_id is null or equals old_manager_id) - old_manager can approve
+                if (currentUserId !== transition.old_manager_id) {
+                  return res.status(403).json({ 
+                    error: 'Only the manager can approve post-transition KRAs' 
+                  });
+                }
               }
             }
           }

@@ -58,20 +58,28 @@ router.get('/', authMiddleware, async (req, res) => {
       sql += ` AND period_type = $${idx++}::period_type`;
       params.push(period_type);
     }
+    // Apply transition_id filtering only for manager views (not for employee viewing own goals)
+    // When a manager views another employee's goals, we need to filter by transition_id
+    // When an employee views their own goals, they should see all their goals (pre + post + full_quarter)
+    const isManagerViewingOtherEmployee = managerId && employee_id && cycle_id && employee_id !== managerId;
+    
     if (transition_id) {
       sql += ` AND transition_id = $${idx++}`;
       params.push(transition_id);
-    } else {
-      // When transition_id is not provided, only return goals where transition_id IS NULL
+    } else if (isManagerViewingOtherEmployee) {
+      // When transition_id is not provided AND it's a manager viewing another employee,
+      // only return goals where transition_id IS NULL
       // This ensures we only get pre-transition and full_quarter goals (not post-transition)
       sql += ` AND transition_id IS NULL`;
     }
+    // If employee is viewing their own goals and transition_id is not provided, don't filter by transition_id
+    // This allows employees to see all their goals (pre + post + full_quarter)
 
     // Apply manager role filtering if viewing another employee's data
     // If quarter is provided, filter for that specific quarter
     // If quarter is not provided, check all quarters for transitions
-    // Note: If new_manager_id is null/empty, it is considered as the old manager
-    if (managerId && employee_id && cycle_id && employee_id !== managerId) {
+    // Note: If new_manager_id is null/empty, it is considered as the same manager
+    if (isManagerViewingOtherEmployee) {
       if (quarter) {
         // Quarter is provided - filter for this specific quarter
         const managerRole = await getManagerRoleForTransition(managerId, employee_id, cycle_id, parseInt(quarter));
@@ -185,7 +193,20 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
     const managerCode = empResult.rows[0].emp_code;
     
     // Build base parameters array
-    const params = [managerCode, managerId];
+    // Note: The database.js function converts $1, $2, $3 to ? placeholders.
+    // Since $2 (managerId) appears 5 times in the query, we need to account for this.
+    // The conversion replaces all $N with ? in reverse order, but the final ? placeholders
+    // appear in the order they exist in the SQL text.
+    // Each ? maps to the next element in the replacements array (0-indexed).
+    // So we need: [managerCode ($1), managerId ($2-1st), managerId ($2-2nd), managerId ($2-3rd), managerId ($2-4th), managerId ($2-5th), cycle_id ($3 if provided), quarter ($4 if provided)]
+    const params = [
+      managerCode,  // $1 (appears once) -> 1st ?
+      managerId,    // $2 (1st occurrence) -> 2nd ?
+      managerId,    // $2 (2nd occurrence) -> 3rd ?
+      managerId,    // $2 (3rd occurrence) -> 4th ?
+      managerId,    // $2 (4th occurrence) -> 5th ?
+      managerId     // $2 (5th occurrence) -> 6th ?
+    ];
     let paramIndex = 3;
     
     // Build WHERE conditions dynamically
@@ -193,12 +214,14 @@ router.get('/pending-approvals', authMiddleware, async (req, res) => {
     let quarterCondition = '';
     
     if (cycle_id) {
-      cycleCondition = ` AND g.cycle_id = $${paramIndex++}`;
+      cycleCondition = ` AND g.cycle_id = $${paramIndex}`;
       params.push(cycle_id);
+      paramIndex++;
     }
     if (quarter) {
-      quarterCondition = ` AND g.quarter = $${paramIndex++}`;
+      quarterCondition = ` AND g.quarter = $${paramIndex}`;
       params.push(parseInt(quarter));
+      paramIndex++;
     }
     
     let sql = `

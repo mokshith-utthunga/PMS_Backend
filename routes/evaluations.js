@@ -19,9 +19,14 @@ router.get('/goal-self-ratings', authMiddleware, async (req, res) => {
     let sql = `
     SELECT 
       g.metric_type,
+      qsr.period_type,
+      qsr.transition_id,
+      qsr.period_start_date,
+      qsr.period_end_date,
       s.*
     FROM goal_self_ratings s
     JOIN goals g ON g.id = s.goal_id
+    LEFT JOIN quarterly_self_reviews qsr ON qsr.id = s.quarterly_review_id
     WHERE 1=1
   `;
     const params = [];
@@ -305,17 +310,39 @@ router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
     );
     // Return response with transition info for frontend date validation bypass
     const responseData = result.rows[0];
-    if (transitionId) {
-      // Check if we're within quarter dates (required constraint for transition actions)
-      const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
-      if (canPerform) {
+    
+    // Check if transition_id was provided in the request (special case - always allow)
+    const transitionIdProvided = transition_id !== undefined && transition_id !== null;
+    
+    if (transitionIdProvided) {
+      // If transition_id is explicitly provided in payload, allow it (special case)
+      responseData.has_active_transition = true;
+      responseData.date_validation_bypassed = true;
+    } else {
+      // transition_id was NOT provided in payload
+      // Check if employee has a transition in the employee_quarter_transitions table
+      const transitionCheck = await query(
+        `SELECT id FROM employee_quarter_transitions 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+        [employee_id, cycle_id, quarterNum]
+      );
+      
+      if (transitionCheck.rows.length > 0) {
+        // Employee has transition in table, allow it
         responseData.has_active_transition = true;
-        responseData.date_validation_bypassed = true; // Frontend can use this to bypass date checks
+        responseData.date_validation_bypassed = true;
       } else {
-        // Transition exists but we're outside quarter dates - don't allow
-        return res.status(400).json({ 
-          error: 'Actions for employees with transitions are only allowed within the current quarter dates' 
-        });
+
+        const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
+        if (canPerform) {
+          responseData.has_active_transition = true;
+          responseData.date_validation_bypassed = true;
+        } else {
+          // Not within quarter dates and no transition - don't allow
+          return res.status(400).json({ 
+            error: 'Actions for employees with transitions are only allowed within the current quarter dates' 
+          });
+        }
       }
     }
     
@@ -808,17 +835,52 @@ router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
 
     // Return response with transition info for frontend date validation bypass
     const responseData = result.rows[0];
-    if (transitionId) {
-      // Check if we're within quarter dates (required constraint for transition actions)
-      const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
-      if (canPerform) {
+    
+    // Check if transition_id or period_type is provided
+    if (transitionId || period_type) {
+      let shouldAllow = false;
+      
+      if (transitionId) {
+        // If transition_id is provided, check if it exists in employee_quarter_transitions table
+        const transitionCheck = await query(
+          `SELECT id FROM employee_quarter_transitions 
+           WHERE id = $1 AND employee_id = $2 AND cycle_id = $3 AND quarter = $4`,
+          [transitionId, employee_id, cycle_id, quarterNum]
+        );
+        
+        if (transitionCheck.rows.length > 0) {
+          // Transition exists in table - allow it
+          shouldAllow = true;
+        }
+      } else if (period_type && (period_type === 'pre_transition' || period_type === 'post_transition')) {
+        // If period_type is provided (and transition_id is not), check if employee has a transition
+        const transitionCheck = await query(
+          `SELECT id FROM employee_quarter_transitions 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+          [employee_id, cycle_id, quarterNum]
+        );
+        
+        if (transitionCheck.rows.length > 0) {
+          // Employee has a transition in table - allow it
+          shouldAllow = true;
+        }
+      }
+      
+      if (shouldAllow) {
         responseData.has_active_transition = true;
         responseData.date_validation_bypassed = true; // Frontend can use this to bypass date checks
       } else {
-        // Transition exists but we're outside quarter dates - don't allow
-        return res.status(400).json({ 
-          error: 'Actions for employees with transitions are only allowed within the current quarter dates' 
-        });
+        // Transition doesn't exist in table or validation failed - apply original validation
+        const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
+        if (canPerform) {
+          responseData.has_active_transition = true;
+          responseData.date_validation_bypassed = true;
+        } else {
+          // Transition exists but we're outside quarter dates - don't allow
+          return res.status(400).json({ 
+            error: 'Actions for employees with transitions are only allowed within the current quarter dates' 
+          });
+        }
       }
     }
     
