@@ -106,12 +106,62 @@ router.get('/active', authMiddleware, async (req, res) => {
       else currentQuarter = 4;
     }
     
-    // Calculate review quarter (previous quarter)
-    // Q1 reviews Q4 (previous year), Q2 reviews Q1, Q3 reviews Q2, Q4 reviews Q3
-    let reviewForQuarter = currentQuarter - 1;
-    if (reviewForQuarter < 1) {
-      reviewForQuarter = 4; // Q1 reviews Q4 of previous year
+    // Determine review quarter by checking which quarter has active review periods
+    // Check quarterly_cycles table for quarters with active self_review or manager_review dates
+    let reviewForQuarter = null;
+    
+    // First, check for active self review periods
+    for (const qc of quarterlyCyclesResult.rows) {
+      if (qc.self_review_start_date && qc.self_review_end_date) {
+        const reviewStart = new Date(qc.self_review_start_date);
+        const reviewEnd = new Date(qc.self_review_end_date);
+        reviewStart.setHours(0, 0, 0, 0);
+        reviewEnd.setHours(23, 59, 59, 999);
+        if (today >= reviewStart && today <= reviewEnd) {
+          reviewForQuarter = qc.quarter;
+          break;
+        }
+      }
     }
+    
+    // If no active self review, check for active manager review periods
+    if (!reviewForQuarter) {
+      for (const qc of quarterlyCyclesResult.rows) {
+        if (qc.quarterly_manager_review_start_date && qc.quarterly_manager_review_end_date) {
+          const reviewStart = new Date(qc.quarterly_manager_review_start_date);
+          const reviewEnd = new Date(qc.quarterly_manager_review_end_date);
+          reviewStart.setHours(0, 0, 0, 0);
+          reviewEnd.setHours(23, 59, 59, 999);
+          if (today >= reviewStart && today <= reviewEnd) {
+            reviewForQuarter = qc.quarter;
+            break;
+          }
+        }
+      }
+    }
+    
+    // If still no review quarter found, calculate based on current quarter (fallback)
+    // Q1 reviews Q4 (previous year), Q2 reviews Q1, Q3 reviews Q2, Q4 reviews Q3
+    if (!reviewForQuarter) {
+      reviewForQuarter = currentQuarter - 1;
+      if (reviewForQuarter < 1) {
+        reviewForQuarter = 4; // Q1 reviews Q4 of previous year
+      }
+    }
+    
+    // Debug logging with table data
+    console.log(`[Active Cycle API] Today: ${todayStr}`);
+    console.log(`[Active Cycle API] Current quarter (from quarter dates): ${currentQuarter}`);
+    console.log(`[Active Cycle API] Review for quarter (from review dates): ${reviewForQuarter}`);
+    console.log(`[Active Cycle API] Quarterly cycles data:`, quarterlyCyclesResult.rows.map(qc => ({
+      quarter: qc.quarter,
+      quarter_start: qc.quarter_start_date,
+      quarter_end: qc.quarter_end_date,
+      self_review_start: qc.self_review_start_date,
+      self_review_end: qc.self_review_end_date,
+      manager_review_start: qc.quarterly_manager_review_start_date,
+      manager_review_end: qc.quarterly_manager_review_end_date
+    })));
     
     // Helper function to check if date is within range
     // Compares dates as strings (YYYY-MM-DD) to avoid timezone issues
