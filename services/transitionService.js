@@ -262,11 +262,17 @@ export async function createTransition(employeeId, cycleId, quarter, transitionD
   const employee = await getEmployeeDetails(employeeId);
   const currentManager = await getEmployeeManager(employeeId);
   
-  // If new_manager_id is same as current manager, set to null (manager didn't change)
-  // This ensures consistent handling - if manager is same, we don't track it as a change
-  const finalNewManagerId = (normalizedNewManagerId && normalizedNewManagerId === currentManager.managerId) 
-    ? null 
-    : normalizedNewManagerId;
+  // If new_manager_id is null, set it to old_manager_id (current manager)
+  // This ensures that when no new manager is specified, the old manager is retained
+  let finalNewManagerId = normalizedNewManagerId;
+  if (!finalNewManagerId && currentManager.managerId) {
+    // If new_manager_id is null and old_manager_id exists, use old_manager_id
+    finalNewManagerId = currentManager.managerId;
+  } else if (finalNewManagerId && finalNewManagerId === currentManager.managerId) {
+    // If new_manager_id is same as current manager, keep it as is (manager didn't change)
+    finalNewManagerId = currentManager.managerId;
+  }
+  // If both are null, finalNewManagerId remains null (no manager assigned)
   
   // Get new manager details if provided and different from current
   let newManagerCode = null;

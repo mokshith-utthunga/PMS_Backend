@@ -262,17 +262,84 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
       };
     }
     
-    // Step 3: Group employees by manager and by grade
-    // For transitions: pre-transition uses raw rating, post-transition gets normalized
+    // Step 3: For transition employees, calculate average (pre-transition HR approved + post-transition) before normalization
+    // This average will be used for normalization and calibration only
+    const transitionAverages = new Map(); // employeeId -> average rating
+    
+    // First pass: Calculate averages for transition employees
+    for (const review of reviewsToProcess) {
+      if (review.period_type === 'post_transition' && review.transition_id) {
+        // Get pre-transition manager review rating that has been HR approved
+        const preTransitionReviewQuery = await query(
+          `SELECT calculated_overall_rating, hr_approved_at
+           FROM quarterly_manager_reviews 
+           WHERE employee_id = $1 
+             AND cycle_id = $2 
+             AND quarter = $3 
+             AND period_type = 'pre_transition'::period_type
+             AND transition_id = $4
+             AND status = 'submitted'
+             AND hr_approved_at IS NOT NULL
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+          [review.employee_id, cycleId, quarter, review.transition_id]
+        );
+        
+        if (preTransitionReviewQuery.rows.length > 0 && preTransitionReviewQuery.rows[0].calculated_overall_rating) {
+          const preRating = parseFloat(preTransitionReviewQuery.rows[0].calculated_overall_rating);
+          const postRating = parseFloat(review.raw_rating);
+          
+          // Calculate average: (pre_transition_rating + post_transition_rating) / 2
+          const averageRating = (preRating + postRating) / 2;
+          transitionAverages.set(review.employee_id, averageRating);
+          
+        }
+      }
+    }
+    
+    // Step 4: For transition employees, get manager_id for grouping
+    // Build a map of transition_id -> manager_id for efficient lookup
+    // If new_manager_id is null, use old_manager_id; if new_manager_id exists and is different, use new_manager_id
+    const transitionManagerMap = new Map(); // transitionId -> manager_id (new_manager_id or old_manager_id)
+    const transitionIds = [...new Set(reviewsToProcess
+      .filter(r => r.period_type === 'post_transition' && r.transition_id)
+      .map(r => r.transition_id))];
+    
+    if (transitionIds.length > 0) {
+      const transitionResult = await query(
+        `SELECT id, new_manager_id, old_manager_id
+         FROM employee_quarter_transitions
+         WHERE id = ANY($1::uuid[])`,
+        [transitionIds]
+      );
+      
+      transitionResult.rows.forEach(t => {
+
+        if (t.new_manager_id && t.old_manager_id && t.new_manager_id !== t.old_manager_id) {
+          transitionManagerMap.set(t.id, t.new_manager_id);
+        } else if (t.old_manager_id) {
+          transitionManagerMap.set(t.id, t.old_manager_id);
+        }
+      });
+    }
+    
+    // Step 5: Group employees by manager and by grade
+    // For transitions: use average (pre + post) for normalization, not just post-transition rating
     const managerGroups = new Map(); // managerId -> [{employeeId, rawRating, grade, periodType, transitionId}]
     const gradeGroups = new Map();   // grade -> [{employeeId, rawRating, managerId, periodType, transitionId}]
     
     reviewsToProcess.forEach(review => {
       const managerId = review.manager_id;
       const grade = review.grade || 'UNKNOWN';
-      const rawRating = parseFloat(review.raw_rating);
+      let rawRating = parseFloat(review.raw_rating);
       const periodType = review.period_type || 'full_quarter';
       const transitionId = review.transition_id || null;
+      
+      // For post-transition reviews with transition, use the calculated average if available
+      if (periodType === 'post_transition' && transitionId && transitionAverages.has(review.employee_id)) {
+        rawRating = transitionAverages.get(review.employee_id);
+        console.log(`[Normalization] Using average ${rawRating} for transition employee ${review.employee_id} (instead of post-transition only ${parseFloat(review.raw_rating)})`);
+      }
       
       // For pre-transition periods: skip normalization (use raw rating)
       // Only normalize full_quarter and post_transition periods
@@ -282,16 +349,25 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
         return;
       }
       
-      // Group by manager (for normalization)
-      if (!managerGroups.has(managerId)) {
-        managerGroups.set(managerId, []);
+      // For transition employees, determine the correct manager_id for normalization grouping
+      // If new_manager_id exists and is different, group with new manager; otherwise use old_manager_id
+      let normalizationManagerId = managerId;
+      if (periodType === 'post_transition' && transitionId && transitionManagerMap.has(transitionId)) {
+        normalizationManagerId = transitionManagerMap.get(transitionId);
+        console.log(`[Normalization] Transition employee ${review.employee_id}: Grouping with manager_id ${normalizationManagerId} for normalization (instead of ${managerId})`);
       }
-      managerGroups.get(managerId).push({
+      
+      // Group by manager (for normalization)
+      if (!managerGroups.has(normalizationManagerId)) {
+        managerGroups.set(normalizationManagerId, []);
+      }
+      managerGroups.get(normalizationManagerId).push({
         employeeId: review.employee_id,
         rawRating,
         grade,
         periodType,
-        transitionId
+        transitionId,
+        originalManagerId: managerId // Store original for reference
       });
       
       // Group by grade (for normalization)
@@ -301,7 +377,7 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
       gradeGroups.get(grade).push({
         employeeId: review.employee_id,
         rawRating,
-        managerId,
+        managerId: normalizationManagerId, // Use normalization manager for grade grouping too
         periodType,
         transitionId
       });
@@ -330,7 +406,7 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
       });
     }
     
-    // Step 5: Normalize goal ratings at grade level
+    // Step 7: Normalize goal ratings at grade level
     const gradeNormalizedRatings = new Map(); // employeeId -> normalized rating
     
     for (const [grade, employees] of gradeGroups) {
@@ -353,7 +429,7 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
       });
     }
     
-    // Step 6: Combine manager and grade normalized ratings
+    // Step 8: Combine manager and grade normalized ratings
     // For transitions: pre-transition uses raw, post-transition uses normalized, then average
     const normalizedResults = [];
     
@@ -378,12 +454,14 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
       let transitionId = null;
       
       if (postReview) {
-        // Employee has transition - post-transition review already contains aggregated rating
-        // The aggregation (pre + post) / 2 was done when New Manager submitted the review
-        // We only need to normalize the aggregated post-transition rating
-        const aggregatedRating = parseFloat(postReview.raw_rating); // This is already (pre + post) / 2
+        // Employee has transition - use the calculated average (pre-transition HR approved + post-transition)
+        // This average was calculated in Step 3 and stored in transitionAverages
+        const aggregatedRating = transitionAverages.has(employeeId) 
+          ? transitionAverages.get(employeeId)
+          : parseFloat(postReview.raw_rating); // Fallback to post-transition only if pre-transition not HR approved
         
-        // Get normalized rating for the aggregated post-transition review
+        // Get normalized rating for the aggregated rating
+        // The normalized rating was calculated using the average in the grouping step
         const postManagerNormalized = managerNormalizedRatings.get(employeeId);
         const postGradeNormalized = gradeNormalizedRatings.get(employeeId);
         
@@ -403,7 +481,7 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
         periodType = 'post_transition'; // Store as post_transition for the normalized_ratings record
         transitionId = postReview.transition_id;
         
-        console.log(`[Normalization] Transition employee ${employeeId}: Aggregated rating ${aggregatedRating} normalized to ${finalRating}`);
+        console.log(`[Normalization] Transition employee ${employeeId}: Average rating ${aggregatedRating} normalized to ${finalRating}`);
       } else if (fullQuarterReview) {
         // Standard full quarter review
         rawOverallRating = parseFloat(fullQuarterReview.raw_rating);
@@ -421,27 +499,6 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
           finalRating = rawOverallRating; // Fallback to raw
         }
         periodType = 'full_quarter';
-      } else if (postReview) {
-        // Only post-transition review (pre-transition excluded from normalization)
-        // Post-transition review already contains aggregated rating from manager submission
-        const aggregatedRating = parseFloat(postReview.raw_rating);
-        const managerNormalized = managerNormalizedRatings.get(employeeId);
-        const gradeNormalized = gradeNormalizedRatings.get(employeeId);
-        
-        if (managerNormalized !== undefined && gradeNormalized !== undefined) {
-          finalRating = finalConfig.managerWeight * managerNormalized + 
-                       finalConfig.gradeWeight * gradeNormalized;
-        } else if (managerNormalized !== undefined) {
-          finalRating = managerNormalized;
-        } else if (gradeNormalized !== undefined) {
-          finalRating = gradeNormalized;
-        } else {
-          finalRating = aggregatedRating; // Fallback to aggregated raw rating
-        }
-        rawOverallRating = aggregatedRating;
-        periodType = 'post_transition';
-        transitionId = postReview.transition_id;
-        console.log(`[Normalization] Transition employee ${employeeId}: Aggregated rating ${aggregatedRating} normalized to ${finalRating}`);
       } else {
         // Fallback - shouldn't happen
         continue;
@@ -471,10 +528,41 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
         period_type: kra.period_type || 'full_quarter'
       }));
       
-      // Get manager ID - use post-transition manager if available, otherwise use review manager
+      // Get manager ID - for transition employees, use new_manager_id if different, otherwise use old_manager_id
+      // If new_manager_id is null, use old_manager_id
       let managerId = review.manager_id;
-      if (postReview) {
-        managerId = postReview.manager_id;
+      if (postReview && postReview.transition_id) {
+        // Get transition details to find new_manager_id or old_manager_id
+        const transitionResult = await query(
+          `SELECT new_manager_id, old_manager_id
+           FROM employee_quarter_transitions
+           WHERE id = $1`,
+          [postReview.transition_id]
+        );
+        
+        if (transitionResult.rows.length > 0) {
+          const transition = transitionResult.rows[0];
+          // If new_manager_id exists and is different from old_manager_id, use new_manager_id
+          // If new_manager_id is null, use old_manager_id
+          // Otherwise (same manager), use the post-transition review's manager_id
+          if (transition.new_manager_id && 
+              transition.old_manager_id && 
+              transition.new_manager_id !== transition.old_manager_id) {
+            managerId = transition.new_manager_id;
+            console.log(`[Normalization] Transition employee ${employeeId}: Using new_manager_id ${managerId} (different from old_manager_id ${transition.old_manager_id})`);
+          } else if (!transition.new_manager_id && transition.old_manager_id) {
+            // new_manager_id is null, use old_manager_id
+            managerId = transition.old_manager_id;
+            console.log(`[Normalization] Transition employee ${employeeId}: Using old_manager_id ${managerId} (new_manager_id is null)`);
+          } else {
+            // Same manager, use post-transition review manager
+            managerId = postReview.manager_id;
+            console.log(`[Normalization] Transition employee ${employeeId}: Using post-transition review manager_id ${managerId} (same manager)`);
+          }
+        } else {
+          // Fallback to post-transition review manager if transition not found
+          managerId = postReview.manager_id;
+        }
       }
       
       normalizedResults.push({

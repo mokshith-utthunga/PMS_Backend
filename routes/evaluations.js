@@ -692,35 +692,10 @@ router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
       }
     }
     
-    // Special handling for transition employees: Aggregation logic
-    // When New Manager submits post-transition review, aggregate with pre-transition rating
+    // For transition employees: Don't calculate average here
+    // The average (pre-transition HR approved + post-transition) will be calculated during normalization
+    // Store only the post-transition rating in calculated_overall_rating
     let finalCalculatedRating = calculated_overall_rating;
-    if (periodType === 'post_transition' && status === 'submitted' && transitionId && calculated_overall_rating) {
-      // Get pre-transition manager review rating
-      const preTransitionReview = await query(
-        `SELECT calculated_overall_rating 
-         FROM quarterly_manager_reviews 
-         WHERE employee_id = $1 
-           AND cycle_id = $2 
-           AND quarter = $3 
-           AND period_type = 'pre_transition'::period_type
-           AND transition_id = $4
-           AND status = 'submitted'
-         ORDER BY updated_at DESC
-         LIMIT 1`,
-        [employee_id, cycle_id, quarterNum, transitionId]
-      );
-
-      if (preTransitionReview.rows.length > 0 && preTransitionReview.rows[0].calculated_overall_rating) {
-        const preRating = parseFloat(preTransitionReview.rows[0].calculated_overall_rating);
-        const postRating = parseFloat(calculated_overall_rating);
-        
-        // Aggregate: overall_rating = (old_manager_overall_rating + new_manager_overall_rating) / 2
-        finalCalculatedRating = ((preRating + postRating) / 2).toFixed(2);
-        
-        console.log(`[Transition Aggregation] Employee ${employee_id}, Quarter ${quarterNum}: Pre=${preRating}, Post=${postRating}, Aggregated=${finalCalculatedRating}`);
-      }
-    }
 
     // Upsert quarterly manager review
     // Use the unique constraint that includes period_type and transition_id
@@ -1003,7 +978,28 @@ router.get('/hr-pending-reviews', authMiddleware, async (req, res) => {
         e.emp_code as employee_code,
         m.full_name as manager_name,
         m.emp_code as manager_code,
-        pc.name as cycle_name
+        pc.name as cycle_name,
+        -- For post-transition reviews, calculate average with pre-transition (if HR approved)
+        CASE 
+          WHEN qmr.period_type = 'post_transition'::period_type AND qmr.transition_id IS NOT NULL THEN
+            COALESCE(
+              (
+                SELECT (pre.calculated_overall_rating + qmr.calculated_overall_rating) / 2.0
+                FROM quarterly_manager_reviews pre
+                WHERE pre.employee_id = qmr.employee_id
+                  AND pre.cycle_id = qmr.cycle_id
+                  AND pre.quarter = qmr.quarter
+                  AND pre.period_type = 'pre_transition'::period_type
+                  AND pre.transition_id = qmr.transition_id
+                  AND pre.status = 'submitted'
+                  AND pre.hr_approved_at IS NOT NULL
+                LIMIT 1
+              ),
+              qmr.calculated_overall_rating
+            )
+          ELSE
+            qmr.calculated_overall_rating
+        END as display_rating
       FROM quarterly_manager_reviews qmr
       JOIN employees e ON e.id = qmr.employee_id
       LEFT JOIN employees m ON m.emp_code = e.manager_code
@@ -1270,15 +1266,103 @@ router.post('/hr/send-to-manager', authMiddleware, requireRole(['hr_admin', 'hrb
 // POST /api/evaluations/manager/review
 // Manager accepts or rejects normalized ratings
 // For transition employees: Must filter by period_type and transition_id
+// If old and new managers are different, only new manager can approve
 router.post('/manager/review', authMiddleware, async (req, res) => {
   try {
     const { employeeId, quarter, cycleId, action, periodType, transitionId } = req.body;
+    const currentUserId = req.user?.userId;
     
     if (!employeeId || !quarter || !cycleId || !action) {
       return res.status(400).json({ error: 'employeeId, quarter, cycleId, and action are required' });
     }
     if (!['ACCEPT', 'REJECT'].includes(action)) {
       return res.status(400).json({ error: 'action must be ACCEPT or REJECT' });
+    }
+    
+    // Check if employee has transition and verify manager authorization
+    const transitionCheck = await query(
+      `SELECT new_manager_id, old_manager_id
+       FROM employee_quarter_transitions
+       WHERE employee_id = $1
+         AND cycle_id = $2
+         AND quarter = $3`,
+      [employeeId, cycleId, parseInt(quarter)]
+    );
+    
+    if (transitionCheck.rows.length > 0) {
+      const transition = transitionCheck.rows[0];
+      // Determine which manager can approve:
+      // - If new_manager_id exists and is different from old_manager_id, only new manager can approve
+      // - If new_manager_id is null, old manager can approve
+      // - If new_manager_id is same as old_manager_id, either can approve (handled by direct manager check below)
+      if (transition.new_manager_id && 
+          transition.old_manager_id && 
+          transition.new_manager_id !== transition.old_manager_id) {
+        // Different managers: only new manager can approve
+        if (currentUserId !== transition.new_manager_id) {
+          return res.status(403).json({ 
+            error: 'Only the new manager can approve normalized ratings for transition employees',
+            hint: 'For transition employees with different old and new managers, only the new manager can approve'
+          });
+        }
+        console.log(`[Manager Review] Transition employee ${employeeId}: New manager ${currentUserId} approving`);
+      } else if (!transition.new_manager_id && transition.old_manager_id) {
+        // new_manager_id is null: old manager can approve
+        if (currentUserId !== transition.old_manager_id) {
+          return res.status(403).json({ 
+            error: 'Only the old manager can approve normalized ratings for transition employees',
+            hint: 'For transition employees where new_manager_id is null, the old manager can approve'
+          });
+        }
+        console.log(`[Manager Review] Transition employee ${employeeId}: Old manager ${currentUserId} approving (new_manager_id is null)`);
+      }
+    }
+    
+    // Also check if user is the direct manager or new manager in transition
+    const employeeCheck = await query(
+      `SELECT e.manager_code, m.id as manager_id
+       FROM employees e
+       LEFT JOIN employees m ON m.emp_code = e.manager_code
+       WHERE e.id = $1`,
+      [employeeId]
+    );
+    
+    if (employeeCheck.rows.length > 0) {
+      const employee = employeeCheck.rows[0];
+      const currentUserEmpCode = await query(
+        `SELECT emp_code FROM employees WHERE id = $1`,
+        [currentUserId]
+      );
+      
+      if (currentUserEmpCode.rows.length > 0) {
+        const userEmpCode = currentUserEmpCode.rows[0].emp_code;
+        const isDirectManager = employee.manager_code === userEmpCode;
+        const isNewManager = transitionCheck.rows.length > 0 && 
+                            transitionCheck.rows[0].new_manager_id === currentUserId;
+        const isOldManager = transitionCheck.rows.length > 0 && 
+                            !transitionCheck.rows[0].new_manager_id &&
+                            transitionCheck.rows[0].old_manager_id === currentUserId;
+        
+        if (!isDirectManager && !isNewManager && !isOldManager) {
+          // Check for delegation
+          const delegationCheck = await query(
+            `SELECT 1 FROM delegations
+             WHERE delegate_id = $1
+               AND reportee_id = $2
+               AND cycle_id = $3
+               AND (quarter = $4 OR quarter IS NULL)
+               AND revoked_at IS NULL`,
+            [currentUserId, employeeId, cycleId, parseInt(quarter)]
+          );
+          
+          if (delegationCheck.rows.length === 0) {
+            return res.status(403).json({ 
+              error: 'Not authorized to review this employee\'s normalized rating',
+              hint: 'You must be the employee\'s manager, new manager (for transitions), or a delegate'
+            });
+          }
+        }
+      }
     }
     
     const newStatus = action === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED';
@@ -1301,7 +1385,7 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
       });
     }
     
-    console.log(`[Manager Review] Employee ${employeeId}, Quarter ${quarter}: ${action}ED`);
+    console.log(`[Manager Review] Employee ${employeeId}, Quarter ${quarter}: ${action}ED by manager ${currentUserId}`);
     res.json({ data: { employeeId, status: newStatus } });
   } catch (error) {
     console.error('Error in manager review:', error);
@@ -1531,10 +1615,13 @@ router.get('/manager/normalized-ratings', authMiddleware, async (req, res) => {
           OR EXISTS (
             SELECT 1 FROM employee_quarter_transitions eqt
             WHERE eqt.employee_id = e.id
-              AND eqt.new_manager_id = $4
               AND eqt.cycle_id = nr.performance_cycle_id
               AND eqt.quarter = nr.quarter
               AND eqt.transition_date <= CURRENT_DATE
+              AND (
+                (eqt.new_manager_id = $4 AND eqt.new_manager_id IS NOT NULL AND eqt.new_manager_id != eqt.old_manager_id)
+                OR (eqt.new_manager_id IS NULL AND eqt.old_manager_id = $4)
+              )
           )
         )
       ORDER BY e.emp_code`,
