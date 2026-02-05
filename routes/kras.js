@@ -56,10 +56,12 @@ router.get('/', authMiddleware, async (req, res) => {
     if (transition_id) {
       sql += ` AND transition_id = $${idx++}`;
       params.push(transition_id);
-    } else if (isManagerViewingOtherEmployee) {
-      // When transition_id is not provided AND it's a manager viewing another employee,
+    } else if (isManagerViewingOtherEmployee && !period_type) {
+      // When transition_id is not provided AND it's a manager viewing another employee AND period_type is not specified,
       // only return KRAs where transition_id IS NULL
       // This ensures we only get pre-transition and full_quarter KRAs (not post-transition)
+      // However, if period_type is specified (e.g., 'pre_transition'), we should not filter by transition_id IS NULL
+      // because pre-transition KRAs have a transition_id set
       sql += ` AND transition_id IS NULL`;
     }
     // If employee is viewing their own goals and transition_id is not provided, don't filter by transition_id
@@ -276,6 +278,17 @@ router.put('/:id', authMiddleware, async (req, res) => {
   try {
     const { title, description, weight, status, quarter, manager_comments } = req.body;
     
+    // Parse and validate quarter if provided
+    let parsedQuarter = null;
+    if (quarter !== undefined && quarter !== null) {
+      // Check if quarter is a valid integer (not a UUID)
+      const quarterNum = typeof quarter === 'string' ? parseInt(quarter, 10) : quarter;
+      if (isNaN(quarterNum) || quarterNum < 1 || quarterNum > 4) {
+        return res.status(400).json({ error: 'Quarter must be a number between 1 and 4' });
+      }
+      parsedQuarter = quarterNum;
+    }
+    
     // Get current KRA details including period_type and transition_id for authorization
     const currentKraResult = await query(
       'SELECT employee_id, cycle_id, quarter, period_type, transition_id FROM kras WHERE id = $1',
@@ -288,8 +301,9 @@ router.put('/:id', authMiddleware, async (req, res) => {
     
     const currentKra = currentKraResult.rows[0];
     
-    // If status is being changed to 'approved', check authorization
-    if (status === 'approved' && currentKra.employee_id && currentKra.cycle_id && currentKra.quarter) {
+    // Check authorization for any update (not just approvals)
+    // This is especially important for transition employees where new manager should be able to update post-transition KRAs
+    if (currentKra.employee_id && currentKra.cycle_id && currentKra.quarter) {
       // Get current user's employee ID
       const currentUserResult = await query(
         'SELECT id FROM employees WHERE profile_id = $1',
@@ -299,49 +313,56 @@ router.put('/:id', authMiddleware, async (req, res) => {
       if (currentUserResult.rows.length > 0) {
         const currentUserId = currentUserResult.rows[0].id;
         
-        // For transition KRAs, verify the correct manager is approving
+        // For transition KRAs, verify the correct manager can update/approve
         if (currentKra.period_type && currentKra.period_type !== 'full_quarter' && currentKra.transition_id) {
-          const transitionResult = await query(
-            'SELECT old_manager_id, new_manager_id FROM employee_quarter_transitions WHERE id = $1',
-            [currentKra.transition_id]
-          );
-          
-          if (transitionResult.rows.length > 0) {
-            const transition = transitionResult.rows[0];
+          try {
+            const transitionResult = await query(
+              'SELECT old_manager_id, new_manager_id FROM employee_quarter_transitions WHERE id = $1',
+              [currentKra.transition_id]
+            );
             
-            // For pre-transition KRAs, only old manager can approve
-            if (currentKra.period_type === 'pre_transition') {
-              if (currentUserId !== transition.old_manager_id) {
-                return res.status(403).json({ 
-                  error: 'Only the pre-transition manager can approve pre-transition KRAs' 
-                });
-              }
-            }
-            // For post-transition KRAs, only new manager can approve
-            // Note: If new_manager_id is null/empty, it is considered as the same manager
-            else if (currentKra.period_type === 'post_transition') {
-              console.log('transition.new_manager_id-', transition.new_manager_id);
-              // If new_manager_id is null/empty, it's the same manager, so old_manager can approve
-              if (transition.new_manager_id && transition.new_manager_id !== transition.old_manager_id) {
-                // Different managers - only new manager can approve post-transition
-                if (currentUserId !== transition.new_manager_id) {
-                  return res.status(403).json({ 
-                    error: 'Only the post-transition manager can approve post-transition KRAs' 
-                  });
-                }
-              } else {
-                // Same manager (new_manager_id is null or equals old_manager_id) - old_manager can approve
-                if (currentUserId !== transition.old_manager_id) {
-                  return res.status(403).json({ 
-                    error: 'Only the manager can approve post-transition KRAs' 
-                  });
+            if (transitionResult.rows.length > 0) {
+              const transition = transitionResult.rows[0];
+              
+              // For pre-transition KRAs, only old manager can update/approve
+              if (currentKra.period_type === 'pre_transition') {
+                if (transition.old_manager_id && currentUserId !== transition.old_manager_id) {
+                  const errorMsg = status === 'approved' 
+                    ? 'Only the pre-transition manager can approve pre-transition KRAs'
+                    : 'Only the pre-transition manager can update pre-transition KRAs';
+                  return res.status(403).json({ error: errorMsg });
                 }
               }
+              // For post-transition KRAs, only new manager can update/approve (if managers are different)
+              // Note: If new_manager_id is null/empty, it is considered as the same manager
+              else if (currentKra.period_type === 'post_transition') {
+                // If new_manager_id is null/empty, it's the same manager, so old_manager can update/approve
+                if (transition.new_manager_id && transition.new_manager_id !== transition.old_manager_id) {
+                  // Different managers - only new manager can update/approve post-transition
+                  if (currentUserId !== transition.new_manager_id) {
+                    const errorMsg = status === 'approved'
+                      ? 'Only the post-transition manager can approve post-transition KRAs'
+                      : 'Only the post-transition manager can update post-transition KRAs';
+                    return res.status(403).json({ error: errorMsg });
+                  }
+                } else {
+                  // Same manager (new_manager_id is null or equals old_manager_id) - old_manager can update/approve
+                  if (transition.old_manager_id && currentUserId !== transition.old_manager_id) {
+                    const errorMsg = status === 'approved'
+                      ? 'Only the manager can approve post-transition KRAs'
+                      : 'Only the manager can update post-transition KRAs';
+                    return res.status(403).json({ error: errorMsg });
+                  }
+                }
+              }
             }
+          } catch (transitionError) {
+            // If transition check fails, log but don't block - let checkManagerOrDelegate handle it
+            console.error('Error checking transition authorization:', transitionError);
           }
         }
         
-        // Check if user is HR/Admin - they can approve any KRA
+        // Check if user is HR/Admin - they can update any KRA
         const isHRAdmin = await hasAnyRole(req.user.userId, ['hr_admin', 'system_admin']);
         
         // If not HR/Admin, check if user is manager or delegate (includes transition checks)
@@ -354,7 +375,10 @@ router.put('/:id', authMiddleware, async (req, res) => {
           );
           
           if (!auth.isAuthorized) {
-            return res.status(403).json({ error: 'Not authorized to approve this KRA' });
+            const errorMessage = status === 'approved' 
+              ? 'Not authorized to approve this KRA' 
+              : 'Not authorized to update this KRA';
+            return res.status(403).json({ error: errorMessage });
           }
         }
       }
@@ -375,7 +399,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
         description ?? null,
         weight ?? null,
         status ?? null,
-        quarter ?? null,
+        parsedQuarter,
         manager_comments ?? null,
         req.params.id
       ]

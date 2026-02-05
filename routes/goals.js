@@ -66,10 +66,12 @@ router.get('/', authMiddleware, async (req, res) => {
     if (transition_id) {
       sql += ` AND transition_id = $${idx++}`;
       params.push(transition_id);
-    } else if (isManagerViewingOtherEmployee) {
-      // When transition_id is not provided AND it's a manager viewing another employee,
+    } else if (isManagerViewingOtherEmployee && !period_type) {
+      // When transition_id is not provided AND it's a manager viewing another employee AND period_type is not specified,
       // only return goals where transition_id IS NULL
       // This ensures we only get pre-transition and full_quarter goals (not post-transition)
+      // However, if period_type is specified (e.g., 'pre_transition'), we should not filter by transition_id IS NULL
+      // because pre-transition goals have a transition_id set
       sql += ` AND transition_id IS NULL`;
     }
     // If employee is viewing their own goals and transition_id is not provided, don't filter by transition_id

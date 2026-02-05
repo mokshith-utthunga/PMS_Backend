@@ -682,6 +682,44 @@ export async function getEmployeeTransitions(employeeId, cycleId = null, quarter
 }
 
 /**
+ * Get all transitions (for admin)
+ */
+export async function getAllTransitions(cycleId = null, quarter = null) {
+  let sql = `
+    SELECT t.*, 
+           e.full_name as name,
+           e.emp_code,
+           e.email,
+           e.department,
+           e.grade,
+           e1.full_name as old_manager_name,
+           e2.full_name as new_manager_name
+    FROM employee_quarter_transitions t
+    LEFT JOIN employees e ON t.employee_id = e.id
+    LEFT JOIN employees e1 ON t.old_manager_id = e1.id
+    LEFT JOIN employees e2 ON t.new_manager_id = e2.id
+    WHERE 1=1
+  `;
+  const params = [];
+  let paramIndex = 1;
+  
+  if (cycleId) {
+    sql += ` AND t.cycle_id = $${paramIndex++}`;
+    params.push(cycleId);
+  }
+  
+  if (quarter) {
+    sql += ` AND t.quarter = $${paramIndex++}`;
+    params.push(quarter);
+  }
+  
+  sql += ' ORDER BY t.transition_date DESC, e.full_name ASC';
+  
+  const result = await query(sql, params);
+  return result.rows;
+}
+
+/**
  * Update transition status
  */
 export async function updateTransitionStatus(transitionId, statusUpdates) {
@@ -718,6 +756,67 @@ export async function updateTransitionStatus(transitionId, statusUpdates) {
   );
   
   return result.rows[0] || null;
+}
+
+/**
+ * Update transition data (for admin editing)
+ */
+export async function updateTransition(transitionId, transitionData) {
+  const {
+    transition_type,
+    transition_date,
+    new_manager_id,
+    new_department,
+    new_grade,
+    new_project
+  } = transitionData;
+  
+  // Get the existing transition to get employee_id, cycle_id, quarter
+  const existing = await getTransitionById(transitionId);
+  if (!existing) {
+    throw new Error('Transition not found');
+  }
+  
+  // Get current employee details
+  const employee = await getEmployeeDetails(existing.employee_id);
+  const currentManager = await getEmployeeManager(existing.employee_id);
+  
+  // Normalize new_manager_id - if null, set to old_manager_id
+  let finalNewManagerId = new_manager_id;
+  if (!finalNewManagerId && currentManager.managerId) {
+    finalNewManagerId = currentManager.managerId;
+  } else if (finalNewManagerId && finalNewManagerId === currentManager.managerId) {
+    finalNewManagerId = currentManager.managerId;
+  }
+  
+  // Update transition
+  const result = await query(
+    `UPDATE employee_quarter_transitions SET
+      transition_type = $1::transition_type,
+      transition_date = $2,
+      new_manager_id = $3,
+      new_department = $4,
+      new_project = $5,
+      new_grade = $6,
+      updated_at = NOW()
+    WHERE id = $7
+    RETURNING *`,
+    [
+      transition_type,
+      transition_date,
+      finalNewManagerId,
+      new_department || employee.department,
+      new_project,
+      new_grade || employee.grade,
+      transitionId
+    ]
+  );
+  
+  if (!result.rows || result.rows.length === 0) {
+    throw new Error('Failed to update transition');
+  }
+  
+  return result.rows[0];
 }
 
 /**

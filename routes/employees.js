@@ -315,6 +315,24 @@ router.get('/search', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/employees/transitions - Get all transitions (admin only)
+// NOTE: This route must be defined BEFORE /:id to avoid route conflicts
+router.get('/transitions', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { cycle_id, quarter } = req.query;
+    
+    const transitions = await transitionService.getAllTransitions(
+      cycle_id || null,
+      quarter ? parseInt(quarter) : null
+    );
+    
+    res.json({ data: transitions });
+  } catch (error) {
+    console.error('Get all transitions error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/employees/:id - Get employee by ID
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
@@ -949,6 +967,36 @@ router.get('/:id/transitions/:transitionId', authMiddleware, async (req, res) =>
     res.json({ data: transition });
   } catch (error) {
     console.error('Get transition error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/employees/:id/transitions/:transitionId - Update transition (admin only)
+router.put('/:id/transitions/:transitionId', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { transitionId } = req.params;
+    const { transition_type, transition_date, new_manager_id, new_department, new_grade, new_project } = req.body;
+    
+    if (!transition_type || !transition_date) {
+      return res.status(400).json({ error: 'Missing required fields: transition_type, transition_date' });
+    }
+    
+    const transition = await transitionService.updateTransition(transitionId, {
+      transition_type,
+      transition_date,
+      new_manager_id,
+      new_department,
+      new_grade,
+      new_project
+    });
+    
+    if (!transition) {
+      return res.status(404).json({ error: 'Transition not found' });
+    }
+    
+    res.json({ data: transition });
+  } catch (error) {
+    console.error('Update transition error:', error);
     res.status(500).json({ error: error.message });
   }
 });
