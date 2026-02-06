@@ -276,6 +276,88 @@ router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
       }
     }
     
+    // Validate that goals are approved before allowing self-evaluation
+    // For transition employees: check if goals for the specific period are approved
+    // For non-transition employees: check if goals are approved
+    let goalsApproved = false;
+    if (periodType && periodType !== 'full_quarter' && transitionId) {
+      // Transition employee: check if goals for the specific period are approved
+      const goalsCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM goals 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND period_type = $4::period_type AND transition_id = $5 
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum, periodType, transitionId]
+      );
+      const goalsCount = parseInt(goalsCheck.rows[0]?.count || '0');
+      
+      // Also check KRAs
+      const krasCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM kras 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND period_type = $4::period_type AND transition_id = $5 
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum, periodType, transitionId]
+      );
+      const krasCount = parseInt(krasCheck.rows[0]?.count || '0');
+      
+      // For post-transition: if post-transition goals are not approved yet, 
+      // allow evaluation if pre-transition goals are approved
+      if (periodType === 'post_transition' && goalsCount === 0 && krasCount === 0) {
+        // Check if pre-transition goals are approved
+        const preGoalsCheck = await query(
+          `SELECT COUNT(*) as count 
+           FROM goals 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+             AND period_type = 'pre_transition'::period_type AND transition_id = $4 
+             AND status = 'approved'`,
+          [employee_id, cycle_id, quarterNum, transitionId]
+        );
+        const preKrasCheck = await query(
+          `SELECT COUNT(*) as count 
+           FROM kras 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+             AND period_type = 'pre_transition'::period_type AND transition_id = $4 
+             AND status = 'approved'`,
+          [employee_id, cycle_id, quarterNum, transitionId]
+        );
+        const preGoalsCount = parseInt(preGoalsCheck.rows[0]?.count || '0');
+        const preKrasCount = parseInt(preKrasCheck.rows[0]?.count || '0');
+        goalsApproved = (preGoalsCount > 0 || preKrasCount > 0);
+      } else {
+        goalsApproved = (goalsCount > 0 || krasCount > 0);
+      }
+    } else {
+      // Non-transition employee: check if any goals are approved
+      const goalsCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM goals 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR transition_id IS NULL)
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum]
+      );
+      const krasCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM kras 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR transition_id IS NULL)
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum]
+      );
+      const goalsCount = parseInt(goalsCheck.rows[0]?.count || '0');
+      const krasCount = parseInt(krasCheck.rows[0]?.count || '0');
+      goalsApproved = (goalsCount > 0 || krasCount > 0);
+    }
+    
+    if (!goalsApproved) {
+      return res.status(400).json({ 
+        error: 'Goals must be approved by the manager before starting self-evaluation' 
+      });
+    }
+    
     // Use the unique constraint that includes period_type and transition_id
     // The constraint is: (employee_id, cycle_id, quarter, period_type, COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))
     const result = await query(
@@ -328,21 +410,44 @@ router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
       );
       
       if (transitionCheck.rows.length > 0) {
-        // Employee has transition in table, allow it
+        // Employee has transition in table, allow it (bypass date restrictions for transition employees)
         responseData.has_active_transition = true;
         responseData.date_validation_bypassed = true;
       } else {
-
-        const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
-        if (canPerform) {
-          responseData.has_active_transition = true;
-          responseData.date_validation_bypassed = true;
-        } else {
-          // Not within quarter dates and no transition - don't allow
-          return res.status(400).json({ 
-            error: 'Actions for employees with transitions are only allowed within the current quarter dates' 
-          });
+        // No transition found - this is a normal (non-transition) employee
+        // For non-transition employees, check if current date is within self-review period dates
+        // This is the normal validation flow for regular employees
+        const quarterlyCycleResult = await query(
+          `SELECT self_review_start_date, self_review_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarterNum]
+        );
+        
+        if (quarterlyCycleResult.rows.length > 0) {
+          const quarterlyCycle = quarterlyCycleResult.rows[0];
+          const selfReviewStart = quarterlyCycle.self_review_start_date;
+          const selfReviewEnd = quarterlyCycle.self_review_end_date;
+          
+          if (selfReviewStart && selfReviewEnd) {
+            const now = new Date();
+            now.setHours(0, 0, 0, 0);
+            const startDate = new Date(selfReviewStart);
+            startDate.setHours(0, 0, 0, 0);
+            const endDate = new Date(selfReviewEnd);
+            endDate.setHours(23, 59, 59, 999);
+            
+            // Check if current date is within self-review period
+            if (now < startDate || now > endDate) {
+              return res.status(400).json({ 
+                error: 'Self-review period is not open. Please check the review period dates.' 
+              });
+            }
+          }
         }
+        
+        // For non-transition employees, normal validation passed (goals approved + within review period)
+        // No need to set has_active_transition or date_validation_bypassed
       }
     }
     
@@ -1270,7 +1375,7 @@ router.post('/hr/send-to-manager', authMiddleware, requireRole(['hr_admin', 'hrb
 router.post('/manager/review', authMiddleware, async (req, res) => {
   try {
     const { employeeId, quarter, cycleId, action, periodType, transitionId } = req.body;
-    const currentUserId = req.user?.userId;
+    const currentUserProfileId = req.user?.userId;
     
     if (!employeeId || !quarter || !cycleId || !action) {
       return res.status(400).json({ error: 'employeeId, quarter, cycleId, and action are required' });
@@ -1278,6 +1383,18 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
     if (!['ACCEPT', 'REJECT'].includes(action)) {
       return res.status(400).json({ error: 'action must be ACCEPT or REJECT' });
     }
+    
+    // Get current user's employee ID from profile_id
+    const currentUserEmpResult = await query(
+      `SELECT id FROM employees WHERE profile_id = $1`,
+      [currentUserProfileId]
+    );
+    
+    if (currentUserEmpResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Current user employee record not found' });
+    }
+    
+    const currentUserEmployeeId = currentUserEmpResult.rows[0].id;
     
     // Check if employee has transition and verify manager authorization
     const transitionCheck = await query(
@@ -1299,22 +1416,20 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
           transition.old_manager_id && 
           transition.new_manager_id !== transition.old_manager_id) {
         // Different managers: only new manager can approve
-        if (currentUserId !== transition.new_manager_id) {
+        if (currentUserEmployeeId !== transition.new_manager_id) {
           return res.status(403).json({ 
             error: 'Only the new manager can approve normalized ratings for transition employees',
             hint: 'For transition employees with different old and new managers, only the new manager can approve'
           });
         }
-        console.log(`[Manager Review] Transition employee ${employeeId}: New manager ${currentUserId} approving`);
       } else if (!transition.new_manager_id && transition.old_manager_id) {
         // new_manager_id is null: old manager can approve
-        if (currentUserId !== transition.old_manager_id) {
+        if (currentUserEmployeeId !== transition.old_manager_id) {
           return res.status(403).json({ 
             error: 'Only the old manager can approve normalized ratings for transition employees',
             hint: 'For transition employees where new_manager_id is null, the old manager can approve'
           });
         }
-        console.log(`[Manager Review] Transition employee ${employeeId}: Old manager ${currentUserId} approving (new_manager_id is null)`);
       }
     }
     
@@ -1329,19 +1444,19 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
     
     if (employeeCheck.rows.length > 0) {
       const employee = employeeCheck.rows[0];
-      const currentUserEmpCode = await query(
+      const currentUserEmpCodeResult = await query(
         `SELECT emp_code FROM employees WHERE id = $1`,
-        [currentUserId]
+        [currentUserEmployeeId]
       );
       
-      if (currentUserEmpCode.rows.length > 0) {
-        const userEmpCode = currentUserEmpCode.rows[0].emp_code;
+      if (currentUserEmpCodeResult.rows.length > 0) {
+        const userEmpCode = currentUserEmpCodeResult.rows[0].emp_code;
         const isDirectManager = employee.manager_code === userEmpCode;
         const isNewManager = transitionCheck.rows.length > 0 && 
-                            transitionCheck.rows[0].new_manager_id === currentUserId;
+                            transitionCheck.rows[0].new_manager_id === currentUserEmployeeId;
         const isOldManager = transitionCheck.rows.length > 0 && 
                             !transitionCheck.rows[0].new_manager_id &&
-                            transitionCheck.rows[0].old_manager_id === currentUserId;
+                            transitionCheck.rows[0].old_manager_id === currentUserEmployeeId;
         
         if (!isDirectManager && !isNewManager && !isOldManager) {
           // Check for delegation
@@ -1352,7 +1467,7 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
                AND cycle_id = $3
                AND (quarter = $4 OR quarter IS NULL)
                AND revoked_at IS NULL`,
-            [currentUserId, employeeId, cycleId, parseInt(quarter)]
+            [currentUserEmployeeId, employeeId, cycleId, parseInt(quarter)]
           );
           
           if (delegationCheck.rows.length === 0) {
@@ -1384,8 +1499,6 @@ router.post('/manager/review', authMiddleware, async (req, res) => {
         hint: 'Make sure the rating status is SENT_TO_MANAGER'
       });
     }
-    
-    console.log(`[Manager Review] Employee ${employeeId}, Quarter ${quarter}: ${action}ED by manager ${currentUserId}`);
     res.json({ data: { employeeId, status: newStatus } });
   } catch (error) {
     console.error('Error in manager review:', error);
@@ -1625,7 +1738,7 @@ router.get('/manager/normalized-ratings', authMiddleware, async (req, res) => {
           )
         )
       ORDER BY e.emp_code`,
-      [cycle_id, parseInt(quarter), managerEmpCode, manager_id]
+      [cycle_id, parseInt(quarter), managerEmpCode, manager_id, manager_id]
     );
     
     res.json({ data: result.rows });

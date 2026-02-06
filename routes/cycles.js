@@ -149,20 +149,7 @@ router.get('/active', authMiddleware, async (req, res) => {
       }
     }
     
-    // Debug logging with table data
-    console.log(`[Active Cycle API] Today: ${todayStr}`);
-    console.log(`[Active Cycle API] Current quarter (from quarter dates): ${currentQuarter}`);
-    console.log(`[Active Cycle API] Review for quarter (from review dates): ${reviewForQuarter}`);
-    console.log(`[Active Cycle API] Quarterly cycles data:`, quarterlyCyclesResult.rows.map(qc => ({
-      quarter: qc.quarter,
-      quarter_start: qc.quarter_start_date,
-      quarter_end: qc.quarter_end_date,
-      self_review_start: qc.self_review_start_date,
-      self_review_end: qc.self_review_end_date,
-      manager_review_start: qc.quarterly_manager_review_start_date,
-      manager_review_end: qc.quarterly_manager_review_end_date
-    })));
-    
+
     // Helper function to check if date is within range
     // Compares dates as strings (YYYY-MM-DD) to avoid timezone issues
     const isDateInRange = (dateStr, startStr, endStr) => {

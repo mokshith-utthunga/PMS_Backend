@@ -289,9 +289,9 @@ router.put('/:id', authMiddleware, async (req, res) => {
       parsedQuarter = quarterNum;
     }
     
-    // Get current KRA details including period_type and transition_id for authorization
+    // Get current KRA details including period_type, transition_id, and status for authorization
     const currentKraResult = await query(
-      'SELECT employee_id, cycle_id, quarter, period_type, transition_id FROM kras WHERE id = $1',
+      'SELECT employee_id, cycle_id, quarter, period_type, transition_id, status FROM kras WHERE id = $1',
       [req.params.id]
     );
     
@@ -313,8 +313,14 @@ router.put('/:id', authMiddleware, async (req, res) => {
       if (currentUserResult.rows.length > 0) {
         const currentUserId = currentUserResult.rows[0].id;
         
-        // For transition KRAs, verify the correct manager can update/approve
-        if (currentKra.period_type && currentKra.period_type !== 'full_quarter' && currentKra.transition_id) {
+        // Check if user is the employee themselves FIRST
+        // Employees can update their own KRAs (pre-transition and post-transition) as long as they're not approving
+        const isEmployee = currentUserId === currentKra.employee_id;
+        
+        // For transition KRAs, verify the correct manager can update/approve (only if user is NOT the employee)
+        // This check only applies to managers, not employees
+        // IMPORTANT: Employees can always update their own KRAs (pre-transition and post-transition) - skip manager checks
+        if (!isEmployee && currentKra.period_type && currentKra.period_type !== 'full_quarter' && currentKra.transition_id) {
           try {
             const transitionResult = await query(
               'SELECT old_manager_id, new_manager_id FROM employee_quarter_transitions WHERE id = $1',
@@ -362,23 +368,55 @@ router.put('/:id', authMiddleware, async (req, res) => {
           }
         }
         
-        // Check if user is HR/Admin - they can update any KRA
-        const isHRAdmin = await hasAnyRole(req.user.userId, ['hr_admin', 'system_admin']);
-        
-        // If not HR/Admin, check if user is manager or delegate (includes transition checks)
-        if (!isHRAdmin) {
-          const auth = await checkManagerOrDelegate(
-            req.user.userId,
-            currentKra.employee_id,
-            currentKra.cycle_id,
-            currentKra.quarter
-          );
+        // Employees can only update their own KRAs in specific cases:
+        // 1. Submitting for approval (status: 'draft' or 'returned' -> 'submitted')
+        // 2. Editing draft/returned KRAs (not changing status to 'approved')
+        if (isEmployee) {
+          const currentStatus = currentKra.status;
           
-          if (!auth.isAuthorized) {
-            const errorMessage = status === 'approved' 
-              ? 'Not authorized to approve this KRA' 
-              : 'Not authorized to update this KRA';
-            return res.status(403).json({ error: errorMessage });
+          // Employees cannot approve their own KRAs
+          if (status === 'approved') {
+            return res.status(403).json({ error: 'You cannot approve your own KRA' });
+          }
+          
+          // Employees can only submit draft/returned KRAs or edit draft/returned KRAs
+          // Allow status changes: draft -> submitted, returned -> submitted
+          // Allow editing when status is draft or returned (status not being changed)
+          if (status === 'submitted') {
+            // Allow submitting draft/returned KRAs for approval
+            if (currentStatus !== 'draft' && currentStatus !== 'returned') {
+              return res.status(403).json({ error: 'Can only submit draft or returned KRAs' });
+            }
+            // Allow the update - employee is submitting their own KRA
+          } else if (status && status !== 'draft' && status !== 'returned') {
+            // Invalid status change for employee
+            return res.status(403).json({ error: 'Invalid status change for employee' });
+          } else if (currentStatus === 'submitted' || currentStatus === 'approved') {
+            // Employee cannot edit submitted or approved KRAs (unless manager returned them)
+            if (status !== 'returned') {
+              return res.status(403).json({ error: 'Cannot edit submitted or approved KRAs' });
+            }
+          }
+          // Allow the update - employee is submitting their own KRA or editing their draft/returned KRA
+        } else {
+          // Not the employee - check if user is HR/Admin or manager/delegate
+          const isHRAdmin = await hasAnyRole(req.user.userId, ['hr_admin', 'system_admin']);
+          
+          // If not HR/Admin, check if user is manager or delegate (includes transition checks)
+          if (!isHRAdmin) {
+            const auth = await checkManagerOrDelegate(
+              req.user.userId,
+              currentKra.employee_id,
+              currentKra.cycle_id,
+              currentKra.quarter
+            );
+            
+            if (!auth.isAuthorized) {
+              const errorMessage = status === 'approved' 
+                ? 'Not authorized to approve this KRA' 
+                : 'Not authorized to update this KRA';
+              return res.status(403).json({ error: errorMessage });
+            }
           }
         }
       }

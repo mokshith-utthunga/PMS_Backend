@@ -560,14 +560,80 @@ router.put('/:id', authMiddleware, async (req, res) => {
   try {
     const { kra_id, title, description, goal_type, metric_type, target_value, weight, due_date, status, manager_comments, calibration } = req.body;
     
-    // Check current goal status - calibration can only be edited until manager approval
-    const currentGoal = await query('SELECT status FROM goals WHERE id = $1', [req.params.id]);
-    if (currentGoal.rows.length === 0) {
+    // Get current goal details including employee_id for authorization
+    const currentGoalResult = await query(
+      'SELECT employee_id, cycle_id, quarter, status, period_type, transition_id FROM goals WHERE id = $1',
+      [req.params.id]
+    );
+    if (currentGoalResult.rows.length === 0) {
       return res.status(404).json({ error: 'Goal not found' });
     }
     
-    const currentStatus = currentGoal.rows[0].status;
+    const currentGoal = currentGoalResult.rows[0];
+    const currentStatus = currentGoal.status;
     const isLocked = currentStatus === 'approved' || currentStatus === 'locked';
+    
+    // Authorization check
+    if (currentGoal.employee_id && currentGoal.cycle_id && currentGoal.quarter) {
+      // Get current user's employee ID
+      const currentUserResult = await query(
+        'SELECT id FROM employees WHERE profile_id = $1',
+        [req.user.userId]
+      );
+      
+      if (currentUserResult.rows.length > 0) {
+        const currentUserId = currentUserResult.rows[0].id;
+        const isEmployee = currentUserId === currentGoal.employee_id;
+        
+        // Employees can only update their own goals in specific cases:
+        // 1. Submitting for approval (status: 'draft' or 'returned' -> 'submitted')
+        // 2. Editing draft/returned goals (not changing status to 'approved')
+        if (isEmployee) {
+          // Employees cannot approve their own goals
+          if (status === 'approved') {
+            return res.status(403).json({ error: 'You cannot approve your own goal' });
+          }
+          
+          // Employees can only submit draft/returned goals or edit draft/returned goals
+          if (status === 'submitted') {
+            // Allow submitting draft/returned goals for approval
+            if (currentStatus !== 'draft' && currentStatus !== 'returned') {
+              return res.status(403).json({ error: 'Can only submit draft or returned goals' });
+            }
+            // Allow the update - employee is submitting their own goal
+          } else if (status && status !== 'draft' && status !== 'returned') {
+            // Invalid status change for employee
+            return res.status(403).json({ error: 'Invalid status change for employee' });
+          } else if (currentStatus === 'submitted' || currentStatus === 'approved') {
+            // Employee cannot edit submitted or approved goals (unless manager returned them)
+            if (status !== 'returned') {
+              return res.status(403).json({ error: 'Cannot edit submitted or approved goals' });
+            }
+          }
+          // Allow the update - employee is submitting their own goal or editing their draft/returned goal
+        } else {
+          // Not the employee - check if user is HR/Admin or manager/delegate
+          const isHRAdmin = await hasAnyRole(req.user.userId, ['hr_admin', 'system_admin']);
+          
+          // If not HR/Admin, check if user is manager or delegate (includes transition checks)
+          if (!isHRAdmin) {
+            const auth = await checkManagerOrDelegate(
+              req.user.userId,
+              currentGoal.employee_id,
+              currentGoal.cycle_id,
+              currentGoal.quarter
+            );
+            
+            if (!auth.isAuthorized) {
+              const errorMessage = status === 'approved' 
+                ? 'Not authorized to approve this goal' 
+                : 'Not authorized to update this goal';
+              return res.status(403).json({ error: errorMessage });
+            }
+          }
+        }
+      }
+    }
     
     // Validate and format calibration if provided
     let calibrationJson = undefined;

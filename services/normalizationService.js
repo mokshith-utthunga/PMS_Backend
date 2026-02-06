@@ -306,11 +306,13 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
       .map(r => r.transition_id))];
     
     if (transitionIds.length > 0) {
+      // Build IN clause with proper parameter placeholders
+      const placeholders = transitionIds.map((_, i) => `$${i + 1}`).join(', ');
       const transitionResult = await query(
         `SELECT id, new_manager_id, old_manager_id
          FROM employee_quarter_transitions
-         WHERE id = ANY($1::uuid[])`,
-        [transitionIds]
+         WHERE id IN (${placeholders})`,
+        transitionIds
       );
       
       transitionResult.rows.forEach(t => {
@@ -691,11 +693,13 @@ export async function normalizeRatings(quarter, cycleId, hrUserId, config = {}) 
               normalized_kra_ratings = $7,
               raw_kpi_ratings = $8,
               raw_kra_ratings = $9,
-              status = CASE 
+              status = CASE
                 WHEN $10 = 'PUBLISHED' THEN $10
                 ELSE 'DRAFT'
               END
-            WHERE employee_id = $11 AND performance_cycle_id = $12 AND quarter = $13
+            WHERE employee_id = $11 
+              AND performance_cycle_id = $12 
+              AND quarter = $13
             RETURNING id
           `;
           upsertResult = await query(updateQuery, [
