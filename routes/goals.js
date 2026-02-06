@@ -55,8 +55,16 @@ router.get('/', authMiddleware, async (req, res) => {
       params.push(parseInt(quarter));
     }
     if (period_type) {
-      sql += ` AND period_type = $${idx++}::period_type`;
-      params.push(period_type);
+      // Special handling for pre_transition: if period_type=pre_transition, also include NULL and full_quarter
+      // This ensures we get old goals (period_type IS NULL) and full_quarter goals in the pre-transition tab
+      if (period_type === 'pre_transition') {
+        sql += ` AND (period_type = $${idx}::period_type OR period_type IS NULL OR period_type = 'full_quarter'::period_type)`;
+        params.push(period_type);
+        idx++;
+      } else {
+        sql += ` AND period_type = $${idx++}::period_type`;
+        params.push(period_type);
+      }
     }
     // Apply transition_id filtering only for manager views (not for employee viewing own goals)
     // When a manager views another employee's goals, we need to filter by transition_id
@@ -64,8 +72,16 @@ router.get('/', authMiddleware, async (req, res) => {
     const isManagerViewingOtherEmployee = managerId && employee_id && cycle_id && employee_id !== managerId;
     
     if (transition_id) {
-      sql += ` AND transition_id = $${idx++}`;
-      params.push(transition_id);
+      // If period_type is pre_transition, also include goals with transition_id IS NULL (old goals)
+      // This ensures old goals (created before transition) are shown in pre-transition tab
+      if (period_type === 'pre_transition') {
+        sql += ` AND (transition_id = $${idx} OR transition_id IS NULL)`;
+        params.push(transition_id);
+        idx++;
+      } else {
+        sql += ` AND transition_id = $${idx++}`;
+        params.push(transition_id);
+      }
     } else if (isManagerViewingOtherEmployee && !period_type) {
       // When transition_id is not provided AND it's a manager viewing another employee AND period_type is not specified,
       // only return goals where transition_id IS NULL

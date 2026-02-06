@@ -275,10 +275,7 @@ router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
         }
       }
     }
-    
-    // Validate that goals are approved before allowing self-evaluation
-    // For transition employees: check if goals for the specific period are approved
-    // For non-transition employees: check if goals are approved
+
     let goalsApproved = false;
     if (periodType && periodType !== 'full_quarter' && transitionId) {
       // Transition employee: check if goals for the specific period are approved
@@ -352,11 +349,12 @@ router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
       goalsApproved = (goalsCount > 0 || krasCount > 0);
     }
     
-    if (!goalsApproved) {
-      return res.status(400).json({ 
-        error: 'Goals must be approved by the manager before starting self-evaluation' 
-      });
-    }
+    
+    // if (!goalsApproved) {
+    //   return res.status(400).json({ 
+    //     error: 'Goals must be approved by the manager before starting self-evaluation' 
+    //   });
+    // }
     
     // Use the unique constraint that includes period_type and transition_id
     // The constraint is: (employee_id, cycle_id, quarter, period_type, COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))
