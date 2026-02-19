@@ -153,7 +153,7 @@ CREATE INDEX IF NOT EXISTS idx_performance_cycles_active_year
 CREATE INDEX IF NOT EXISTS idx_performance_cycles_applicable_business_units
     ON public.performance_cycles USING gin
     (applicable_business_units COLLATE pg_catalog."default")
-    WITH (fastupdate=True, gin_pending_list_limit=4194304)
+    WITH (fastupdate=True, gin_pending_list_limit=2097151)
     TABLESPACE pg_default
     WHERE applicable_business_units IS NOT NULL;
 -- Index: idx_performance_cycles_applicable_departments
@@ -163,7 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_performance_cycles_applicable_business_units
 CREATE INDEX IF NOT EXISTS idx_performance_cycles_applicable_departments
     ON public.performance_cycles USING gin
     (applicable_departments COLLATE pg_catalog."default")
-    WITH (fastupdate=True, gin_pending_list_limit=4194304)
+    WITH (fastupdate=True, gin_pending_list_limit=2097151)
     TABLESPACE pg_default
     WHERE applicable_departments IS NOT NULL;
 -- Index: idx_performance_cycles_created_at
@@ -605,9 +605,96 @@ COMMENT ON COLUMN public.kpi_templates.calibration
 CREATE INDEX IF NOT EXISTS idx_kpi_templates_calibration
     ON public.kpi_templates USING gin
     (calibration)
-    WITH (fastupdate=True, gin_pending_list_limit=4194304)
+    WITH (fastupdate=True, gin_pending_list_limit=2097151)
     TABLESPACE pg_default
     WHERE calibration IS NOT NULL;
+
+------------------------------------------------------------------------------
+--employee_quarter_transition
+
+CREATE TYPE transition_type AS ENUM (
+  'promotion',
+  'project_change',
+  'role_change'
+);
+CREATE TABLE IF NOT EXISTS public.employee_quarter_transitions
+(
+    id uuid NOT NULL DEFAULT gen_random_uuid(),
+    employee_id uuid NOT NULL,
+    cycle_id uuid NOT NULL,
+    quarter integer NOT NULL,
+    transition_type transition_type NOT NULL,
+    transition_date date NOT NULL,
+    old_manager_id uuid,
+    new_manager_id uuid,
+    old_department text COLLATE pg_catalog."default",
+    new_department text COLLATE pg_catalog."default",
+    old_project text COLLATE pg_catalog."default",
+    new_project text COLLATE pg_catalog."default",
+    old_grade text COLLATE pg_catalog."default",
+    new_grade text COLLATE pg_catalog."default",
+    old_period_closed boolean NOT NULL DEFAULT false,
+    old_period_reviewed boolean NOT NULL DEFAULT false,
+    new_period_goals_set boolean NOT NULL DEFAULT false,
+    new_period_approved boolean NOT NULL DEFAULT false,
+    created_by uuid,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT employee_quarter_transitions_pkey PRIMARY KEY (id),
+    CONSTRAINT employee_quarter_transitions_employee_id_cycle_id_quarter_key UNIQUE (employee_id, cycle_id, quarter),
+    CONSTRAINT employee_quarter_transitions_created_by_fkey FOREIGN KEY (created_by)
+        REFERENCES public.profiles (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL,
+    CONSTRAINT employee_quarter_transitions_cycle_id_fkey FOREIGN KEY (cycle_id)
+        REFERENCES public.performance_cycles (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE CASCADE,
+    CONSTRAINT employee_quarter_transitions_employee_id_fkey FOREIGN KEY (employee_id)
+        REFERENCES public.employees (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE CASCADE,
+    CONSTRAINT employee_quarter_transitions_new_manager_id_fkey FOREIGN KEY (new_manager_id)
+        REFERENCES public.employees (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL,
+    CONSTRAINT employee_quarter_transitions_old_manager_id_fkey FOREIGN KEY (old_manager_id)
+        REFERENCES public.employees (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL,
+    CONSTRAINT employee_quarter_transitions_quarter_check CHECK (quarter >= 1 AND quarter <= 4)
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS public.employee_quarter_transitions
+    OWNER to postgres;
+
+COMMENT ON TABLE public.employee_quarter_transitions
+    IS 'Tracks mid-quarter employee transitions (promotions, project changes, role changes)';
+
+
+CREATE INDEX IF NOT EXISTS idx_employee_quarter_transitions_employee_cycle
+    ON public.employee_quarter_transitions USING btree
+    (employee_id ASC NULLS LAST, cycle_id ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+
+
+CREATE INDEX IF NOT EXISTS idx_employee_quarter_transitions_quarter
+    ON public.employee_quarter_transitions USING btree
+    (quarter ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+
+
+CREATE INDEX IF NOT EXISTS idx_employee_quarter_transitions_transition_date
+    ON public.employee_quarter_transitions USING btree
+    (transition_date ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+
+-----------------------------------------------------------------------------
 
 --kras table
 CREATE TYPE goal_status AS ENUM (
@@ -617,7 +704,11 @@ CREATE TYPE goal_status AS ENUM (
   'returned',
   'locked'
 );
-
+CREATE TYPE period_type as ENUM(
+'full_quarter',
+'pre_transition',
+'post_transition'
+);
 CREATE TABLE IF NOT EXISTS public.kras
 (
     id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -723,199 +814,24 @@ CREATE INDEX IF NOT EXISTS idx_kras_transition_id
     WITH (fillfactor=100, deduplicate_items=True)
     TABLESPACE pg_default;
 --------------------------------------------------------------------
---employee_quarter_transition
-
-CREATE TYPE transition_type AS ENUM (
-  'promotion',
-  'project_change',
-  'role_change'
-);
-CREATE TABLE IF NOT EXISTS public.employee_quarter_transitions
-(
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    employee_id uuid NOT NULL,
-    cycle_id uuid NOT NULL,
-    quarter integer NOT NULL,
-    transition_type transition_type NOT NULL,
-    transition_date date NOT NULL,
-    old_manager_id uuid,
-    new_manager_id uuid,
-    old_department text COLLATE pg_catalog."default",
-    new_department text COLLATE pg_catalog."default",
-    old_project text COLLATE pg_catalog."default",
-    new_project text COLLATE pg_catalog."default",
-    old_grade text COLLATE pg_catalog."default",
-    new_grade text COLLATE pg_catalog."default",
-    old_period_closed boolean NOT NULL DEFAULT false,
-    old_period_reviewed boolean NOT NULL DEFAULT false,
-    new_period_goals_set boolean NOT NULL DEFAULT false,
-    new_period_approved boolean NOT NULL DEFAULT false,
-    created_by uuid,
-    created_at timestamp with time zone NOT NULL DEFAULT now(),
-    updated_at timestamp with time zone NOT NULL DEFAULT now(),
-    CONSTRAINT employee_quarter_transitions_pkey PRIMARY KEY (id),
-    CONSTRAINT employee_quarter_transitions_employee_id_cycle_id_quarter_key UNIQUE (employee_id, cycle_id, quarter),
-    CONSTRAINT employee_quarter_transitions_created_by_fkey FOREIGN KEY (created_by)
-        REFERENCES public.profiles (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE SET NULL,
-    CONSTRAINT employee_quarter_transitions_cycle_id_fkey FOREIGN KEY (cycle_id)
-        REFERENCES public.performance_cycles (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE CASCADE,
-    CONSTRAINT employee_quarter_transitions_employee_id_fkey FOREIGN KEY (employee_id)
-        REFERENCES public.employees (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE CASCADE,
-    CONSTRAINT employee_quarter_transitions_new_manager_id_fkey FOREIGN KEY (new_manager_id)
-        REFERENCES public.employees (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE SET NULL,
-    CONSTRAINT employee_quarter_transitions_old_manager_id_fkey FOREIGN KEY (old_manager_id)
-        REFERENCES public.employees (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE SET NULL,
-    CONSTRAINT employee_quarter_transitions_quarter_check CHECK (quarter >= 1 AND quarter <= 4)
-)
-
-TABLESPACE pg_default;
-
-ALTER TABLE IF EXISTS public.employee_quarter_transitions
-    OWNER to postgres;
-
-COMMENT ON TABLE public.employee_quarter_transitions
-    IS 'Tracks mid-quarter employee transitions (promotions, project changes, role changes)';
 
 
-CREATE INDEX IF NOT EXISTS idx_employee_quarter_transitions_employee_cycle
-    ON public.employee_quarter_transitions USING btree
-    (employee_id ASC NULLS LAST, cycle_id ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
-
-
-CREATE INDEX IF NOT EXISTS idx_employee_quarter_transitions_quarter
-    ON public.employee_quarter_transitions USING btree
-    (quarter ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
-
-
-CREATE INDEX IF NOT EXISTS idx_employee_quarter_transitions_transition_date
-    ON public.employee_quarter_transitions USING btree
-    (transition_date ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
-
------------------------------------------------------------------------------
-
----kras
-CREATE TABLE IF NOT EXISTS public.kras
-(
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    employee_id uuid NOT NULL,
-    cycle_id uuid NOT NULL,
-    title text COLLATE pg_catalog."default" NOT NULL,
-    description text COLLATE pg_catalog."default",
-    weight numeric NOT NULL,
-    status goal_status NOT NULL DEFAULT 'draft'::goal_status,
-    manager_comments text COLLATE pg_catalog."default",
-    created_at timestamp with time zone NOT NULL DEFAULT now(),
-    updated_at timestamp with time zone NOT NULL DEFAULT now(),
-    quarter integer,
-    kra_template_id uuid,
-    period_type period_type DEFAULT 'full_quarter'::period_type,
-    transition_id uuid,
-    period_start_date date,
-    period_end_date date,
-    CONSTRAINT kras_pkey PRIMARY KEY (id),
-    CONSTRAINT kras_cycle_id_fkey FOREIGN KEY (cycle_id)
-        REFERENCES public.performance_cycles (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE CASCADE,
-    CONSTRAINT kras_employee_id_fkey FOREIGN KEY (employee_id)
-        REFERENCES public.employees (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE CASCADE,
-    CONSTRAINT kras_kra_template_id_fkey FOREIGN KEY (kra_template_id)
-        REFERENCES public.kra_templates (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE SET NULL,
-    CONSTRAINT kras_transition_id_fkey FOREIGN KEY (transition_id)
-        REFERENCES public.employee_quarter_transitions (id) MATCH SIMPLE
-        ON UPDATE NO ACTION
-        ON DELETE SET NULL,
-    CONSTRAINT kras_weight_check CHECK (weight > 0::numeric AND weight <= 100::numeric),
-    CONSTRAINT kras_quarter_check CHECK (quarter >= 1 AND quarter <= 4)
-)
-
-TABLESPACE pg_default;
-
-ALTER TABLE IF EXISTS public.kras
-    OWNER to postgres;
-
-COMMENT ON COLUMN public.kras.kra_template_id
-    IS 'Reference to the KRA template used to create this KRA. NULL if created as custom KRA.';
-
-COMMENT ON COLUMN public.kras.period_type
-    IS 'Identifies if KRA belongs to full quarter, pre-transition, or post-transition period';
-
-
-CREATE INDEX IF NOT EXISTS idx_kras_cycle_id
-    ON public.kras USING btree
-    (cycle_id ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
-
-
-CREATE INDEX IF NOT EXISTS idx_kras_employee_id
-    ON public.kras USING btree
-    (employee_id ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
-
-
-CREATE INDEX IF NOT EXISTS idx_kras_kra_template_id
-    ON public.kras USING btree
-    (kra_template_id ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default
-    WHERE kra_template_id IS NOT NULL;
-
-
-CREATE INDEX IF NOT EXISTS idx_kras_period_type
-    ON public.kras USING btree
-    (period_type ASC NULLS LAST, transition_id ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
-
-
-CREATE INDEX IF NOT EXISTS idx_kras_quarter
-    ON public.kras USING btree
-    (quarter ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
-
-
-CREATE INDEX IF NOT EXISTS idx_kras_transition_id
-    ON public.kras USING btree
-    (transition_id ASC NULLS LAST)
-    WITH (fillfactor=100, deduplicate_items=True)
-    TABLESPACE pg_default;
 
 ----------------------------------------------------------------------------
 
 ---goals table
-CREATE TYPE goal_type AS ENUM (
-  'kpi',
-  'okr',
-  'competency'
-);
+
 
 CREATE TYPE period_type AS ENUM (
   'full_quarter',
   'pre_transition',
   'post_transition'
+);
+
+CREATE TYPE goal_type AS ENUM (
+  'kpi',
+  'okr',
+  'competency'
 );
 
 CREATE TABLE IF NOT EXISTS public.goals
@@ -1005,7 +921,7 @@ CREATE INDEX IF NOT EXISTS idx_goals_admin_override_by
 CREATE INDEX IF NOT EXISTS idx_goals_calibration
     ON public.goals USING gin
     (calibration)
-    WITH (fastupdate=True, gin_pending_list_limit=4194304)
+    WITH (fastupdate=True, gin_pending_list_limit=2097151)
     TABLESPACE pg_default
     WHERE calibration IS NOT NULL;
 
@@ -1186,7 +1102,7 @@ CREATE TABLE IF NOT EXISTS public.goal_self_ratings
 TABLESPACE pg_default;
 
 ALTER TABLE IF EXISTS public.goal_self_ratings
-    OWNER to postgres
+    OWNER to postgres;
 ----------------------------------------------------------------------------------
 --quarterly_manager_review
 
@@ -1703,14 +1619,14 @@ CREATE INDEX IF NOT EXISTS idx_normalized_ratings_employee
 CREATE INDEX IF NOT EXISTS idx_normalized_ratings_kpi_ratings
     ON public.normalized_ratings USING gin
     (normalized_kpi_ratings)
-    WITH (fastupdate=True, gin_pending_list_limit=4194304)
+    WITH (fastupdate=True, gin_pending_list_limit=2097151)
     TABLESPACE pg_default;
 
 
 CREATE INDEX IF NOT EXISTS idx_normalized_ratings_kra_ratings
     ON public.normalized_ratings USING gin
     (normalized_kra_ratings)
-    WITH (fastupdate=True, gin_pending_list_limit=4194304)
+    WITH (fastupdate=True, gin_pending_list_limit=2097151)
     TABLESPACE pg_default;
 
 
@@ -1835,3 +1751,64 @@ TABLESPACE pg_default;
 
 ALTER TABLE IF EXISTS public.grades
     OWNER to postgres;
+
+---------------------------------------------------------------------------
+--manager_history
+CREATE TABLE IF NOT EXISTS public.manager_history
+(
+    id uuid NOT NULL DEFAULT gen_random_uuid(),
+    employee_id uuid NOT NULL,
+    old_manager_id uuid,
+    new_manager_id uuid,
+    effective_date date NOT NULL,
+    changed_by uuid,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    transition_id uuid,
+    CONSTRAINT manager_history_pkey PRIMARY KEY (id),
+    CONSTRAINT manager_history_changed_by_fkey FOREIGN KEY (changed_by)
+        REFERENCES public.profiles (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL,
+    CONSTRAINT manager_history_employee_id_fkey FOREIGN KEY (employee_id)
+        REFERENCES public.employees (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE CASCADE,
+    CONSTRAINT manager_history_new_manager_id_fkey FOREIGN KEY (new_manager_id)
+        REFERENCES public.employees (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL,
+    CONSTRAINT manager_history_old_manager_id_fkey FOREIGN KEY (old_manager_id)
+        REFERENCES public.employees (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL,
+    CONSTRAINT manager_history_transition_id_fkey FOREIGN KEY (transition_id)
+        REFERENCES public.employee_quarter_transitions (id) MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE SET NULL
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS public.manager_history
+    OWNER to postgres;
+
+COMMENT ON COLUMN public.manager_history.transition_id
+    IS 'Direct reference to employee_quarter_transitions. Links manager change to specific transition record.';
+-- Index: idx_manager_history_employee_transition
+
+-- DROP INDEX IF EXISTS public.idx_manager_history_employee_transition;
+
+CREATE INDEX IF NOT EXISTS idx_manager_history_employee_transition
+    ON public.manager_history USING btree
+    (employee_id ASC NULLS LAST, transition_id ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+-- Index: idx_manager_history_transition_id
+
+-- DROP INDEX IF EXISTS public.idx_manager_history_transition_id;
+
+CREATE INDEX IF NOT EXISTS idx_manager_history_transition_id
+    ON public.manager_history USING btree
+    (transition_id ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;

@@ -26,10 +26,6 @@ const isValidSSORole = (role) => {
   return role && ALLOWED_SSO_ROLES.includes(role.toLowerCase());
 };
 
-
-
-
-
 router.get('/', async (req, res) => {
   try {
     const { 
@@ -185,9 +181,7 @@ router.get('/', async (req, res) => {
       // Sync employee data from User Master API after successful authentication
       // Use email for SSO login as per requirements
       try {
-        console.log(`[SSO] Attempting to sync employee data for profileId: ${profileId}, email: ${email}, employeeCode: ${employeeCode}`);
         const syncResult = await syncEmployeeDataFromUserMaster(profileId, email, employeeCode);
-        console.log(`[SSO] Sync result: ${syncResult}`);
       } catch (syncError) {
         // Log error but don't fail login if sync fails
         console.error('[SSO] Error syncing employee data from User Master:', syncError);
@@ -198,11 +192,33 @@ router.get('/', async (req, res) => {
       setAuthCookies(res, token, user);
 
       const frontendOrigin = req.headers.origin || req.headers.referer?.split('/').slice(0, 3).join('/');
-      const redirectUrl = frontendOrigin && frontendOrigin.includes('localhost:8080') 
-        ? `${frontendOrigin}/dashboard` 
-        : process.env.FRONTEND_URL 
-          ? `${process.env.FRONTEND_URL}/dashboard`
-          : '/dashboard';
+      const frontendUrl = process.env.FRONTEND_URL;
+      
+      // Determine redirect URL: prefer frontendOrigin if it matches FRONTEND_URL, otherwise use FRONTEND_URL
+      let redirectUrl = '/dashboard';
+      if (frontendUrl && frontendOrigin) {
+        // Check if frontendOrigin matches or is from the same domain as FRONTEND_URL
+        try {
+          const frontendUrlObj = new URL(frontendUrl);
+          const originUrlObj = new URL(frontendOrigin);
+          if (originUrlObj.origin === frontendUrlObj.origin) {
+            redirectUrl = `${frontendOrigin}/dashboard`;
+          } else {
+            redirectUrl = `${frontendUrl}/dashboard`;
+          }
+        } catch (e) {
+          // If URL parsing fails, fallback to simple string comparison
+          if (frontendOrigin.includes(frontendUrl) || frontendUrl.includes(frontendOrigin)) {
+            redirectUrl = `${frontendOrigin}/dashboard`;
+          } else {
+            redirectUrl = `${frontendUrl}/dashboard`;
+          }
+        }
+      } else if (frontendUrl) {
+        redirectUrl = `${frontendUrl}/dashboard`;
+      } else if (frontendOrigin) {
+        redirectUrl = `${frontendOrigin}/dashboard`;
+      }
 
       // Redirect to dashboard
       return res.redirect(redirectUrl);
@@ -570,11 +586,33 @@ router.get('/callback', async (req, res) => {
 
     // Determine redirect URL - check for frontend origin in headers (from proxy)
     const frontendOrigin = req.headers.origin || req.headers.referer?.split('/').slice(0, 3).join('/');
-    const redirectUrl = frontendOrigin && frontendOrigin.includes('localhost:8080') 
-      ? `${frontendOrigin}/dashboard` 
-      : process.env.FRONTEND_URL 
-        ? `${process.env.FRONTEND_URL}/dashboard`
-        : '/dashboard';
+    const frontendUrl = process.env.FRONTEND_URL;
+    
+    // Determine redirect URL: prefer frontendOrigin if it matches FRONTEND_URL, otherwise use FRONTEND_URL
+    let redirectUrl = '/dashboard';
+    if (frontendUrl && frontendOrigin) {
+      // Check if frontendOrigin matches or is from the same domain as FRONTEND_URL
+      try {
+        const frontendUrlObj = new URL(frontendUrl);
+        const originUrlObj = new URL(frontendOrigin);
+        if (originUrlObj.origin === frontendUrlObj.origin) {
+          redirectUrl = `${frontendOrigin}/dashboard`;
+        } else {
+          redirectUrl = `${frontendUrl}/dashboard`;
+        }
+      } catch (e) {
+        // If URL parsing fails, fallback to simple string comparison
+        if (frontendOrigin.includes(frontendUrl) || frontendUrl.includes(frontendOrigin)) {
+          redirectUrl = `${frontendOrigin}/dashboard`;
+        } else {
+          redirectUrl = `${frontendUrl}/dashboard`;
+        }
+      }
+    } else if (frontendUrl) {
+      redirectUrl = `${frontendUrl}/dashboard`;
+    } else if (frontendOrigin) {
+      redirectUrl = `${frontendOrigin}/dashboard`;
+    }
 
     // Redirect to dashboard
     res.redirect(redirectUrl);

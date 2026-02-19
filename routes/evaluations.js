@@ -1,7 +1,17 @@
 import express from 'express';
+import multer from 'multer';
+import path from 'path';
+import { uploadFileToSharePoint, deleteFileFromSharePoint, getFileDownloadUrl } from '../services/sharepoint.service.js';
+import { fileURLToPath } from 'url';
 import { query } from '../config/database.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
+import { normalizeRatings } from '../services/normalizationService.js';
+import { applyCalibration, isCalibrationEnabled } from '../services/calibrationService.js';
 import { checkManagerOrDelegate } from './delegations.js';
+import { canPerformTransitionActions, getManagerRoleForTransition } from '../services/transitionService.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const router = express.Router();
 
@@ -11,14 +21,19 @@ const router = express.Router();
 router.get('/goal-self-ratings', authMiddleware, async (req, res) => {
   try {
     const { quarterly_review_id, goal_id } = req.query;
-    
-    
+
+
     let sql = `
     SELECT 
       g.metric_type,
+      qsr.period_type,
+      qsr.transition_id,
+      qsr.period_start_date,
+      qsr.period_end_date,
       s.*
     FROM goal_self_ratings s
     JOIN goals g ON g.id = s.goal_id
+    LEFT JOIN quarterly_self_reviews qsr ON qsr.id = s.quarterly_review_id
     WHERE 1=1
   `;
     const params = [];
@@ -45,7 +60,60 @@ router.get('/goal-self-ratings', authMiddleware, async (req, res) => {
 router.post('/goal-self-ratings', authMiddleware, async (req, res) => {
   try {
     const { quarterly_review_id, goal_id, achievement, self_rating, evidence, achieved_value, target_value } = req.body;
-    
+
+    // Validate required fields
+    if (!quarterly_review_id) {
+      return res.status(400).json({ error: 'quarterly_review_id is required' });
+    }
+    if (!goal_id) {
+      return res.status(400).json({ error: 'goal_id is required' });
+    }
+
+    // Validate self_rating range if provided
+    if (self_rating !== null && self_rating !== undefined) {
+      if (self_rating < 1 || self_rating > 5) {
+        return res.status(400).json({ error: 'self_rating must be between 1 and 5' });
+      }
+    }
+
+    // Check if goal exists
+    const goalCheck = await query('SELECT id, employee_id, cycle_id, quarter FROM goals WHERE id = $1', [goal_id]);
+    if (goalCheck.rows.length === 0) {
+      return res.status(404).json({ error: `Goal with id ${goal_id} does not exist` });
+    }
+
+    // Check if quarterly_review exists and matches goal
+    const reviewCheck = await query(
+      'SELECT id, employee_id, cycle_id, quarter FROM quarterly_self_reviews WHERE id = $1',
+      [quarterly_review_id]
+    );
+    if (reviewCheck.rows.length === 0) {
+      return res.status(404).json({ error: `Quarterly review with id ${quarterly_review_id} does not exist` });
+    }
+
+    const goal = goalCheck.rows[0];
+    const review = reviewCheck.rows[0];
+
+    // Validate that quarterly_review matches the goal's employee, cycle, and quarter
+    if (review.employee_id !== goal.employee_id) {
+      return res.status(400).json({ 
+        error: 'Quarterly review employee_id does not match goal employee_id',
+        details: { review_employee_id: review.employee_id, goal_employee_id: goal.employee_id }
+      });
+    }
+    if (review.cycle_id !== goal.cycle_id) {
+      return res.status(400).json({ 
+        error: 'Quarterly review cycle_id does not match goal cycle_id',
+        details: { review_cycle_id: review.cycle_id, goal_cycle_id: goal.cycle_id }
+      });
+    }
+    if (review.quarter !== goal.quarter) {
+      return res.status(400).json({ 
+        error: 'Quarterly review quarter does not match goal quarter',
+        details: { review_quarter: review.quarter, goal_quarter: goal.quarter }
+      });
+    }
+
     const result = await query(
       `INSERT INTO goal_self_ratings (id, quarterly_review_id, goal_id, achievement, self_rating, evidence, achieved_value, target_value, created_at, updated_at)
        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
@@ -58,8 +126,8 @@ router.post('/goal-self-ratings', authMiddleware, async (req, res) => {
          updated_at = NOW()
        RETURNING *`,
       [
-        quarterly_review_id ?? null,
-        goal_id ?? null,
+        quarterly_review_id,
+        goal_id,
         achievement ?? null,
         self_rating ?? null,
         evidence ?? null,
@@ -70,7 +138,29 @@ router.post('/goal-self-ratings', authMiddleware, async (req, res) => {
     res.json({ data: result.rows[0] });
   } catch (error) {
     console.error('Upsert goal self rating error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      constraint: error.constraint,
+      detail: error.detail
+    });
+    
+    // Provide more specific error messages
+    if (error.code === '23503') { // Foreign key violation
+      if (error.constraint === 'goal_self_ratings_goal_id_fkey') {
+        return res.status(400).json({ error: `Goal with id ${goal_id} does not exist in the goals table` });
+      }
+      if (error.constraint === 'goal_self_ratings_quarterly_review_id_fkey') {
+        return res.status(400).json({ error: `Quarterly review with id ${quarterly_review_id} does not exist` });
+      }
+    }
+    if (error.code === '23514') { // Check constraint violation
+      if (error.constraint === 'goal_self_ratings_self_rating_check') {
+        return res.status(400).json({ error: 'self_rating must be between 1 and 5' });
+      }
+    }
+    
+    res.status(500).json({ error: error.message, details: error.detail });
   }
 });
 
@@ -78,11 +168,11 @@ router.post('/goal-self-ratings', authMiddleware, async (req, res) => {
 router.post('/goal-self-ratings/bulk', authMiddleware, async (req, res) => {
   try {
     const { quarterly_review_id, ratings } = req.body;
-    
+
     if (!ratings || !Array.isArray(ratings) || ratings.length === 0) {
       return res.json({ data: [] });
     }
-    
+
     const results = [];
     for (const rating of ratings) {
       const result = await query(
@@ -110,7 +200,7 @@ router.post('/goal-self-ratings/bulk', authMiddleware, async (req, res) => {
         results.push(result.rows[0]);
       }
     }
-    
+
     res.json({ data: results });
   } catch (error) {
     console.error('Bulk upsert goal self ratings error:', error);
@@ -122,7 +212,7 @@ router.post('/goal-self-ratings/bulk', authMiddleware, async (req, res) => {
 router.put('/goal-self-ratings/:id', authMiddleware, async (req, res) => {
   try {
     const { achievement, self_rating, evidence, achieved_value, target_value } = req.body;
-    
+
     const result = await query(
       `UPDATE goal_self_ratings SET
         achievement = COALESCE($1, achievement),
@@ -141,7 +231,7 @@ router.put('/goal-self-ratings/:id', authMiddleware, async (req, res) => {
         req.params.id
       ]
     );
-    
+
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Goal self rating not found' });
     }
@@ -152,13 +242,13 @@ router.put('/goal-self-ratings/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// ========== QUARTERLY REVIEWS ==========
+// ========== QUARTERLY SELF REVIEWS ==========
 
 // GET /api/evaluations/quarterly-self-reviews
 router.get('/quarterly-self-reviews', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, quarter } = req.query;
-    
+    const { employee_id, cycle_id, quarter, period_type, transition_id } = req.query;
+
     let sql = 'SELECT * FROM quarterly_self_reviews WHERE 1=1';
     const params = [];
     let idx = 1;
@@ -171,46 +261,293 @@ router.get('/quarterly-self-reviews', authMiddleware, async (req, res) => {
       sql += ` AND cycle_id = $${idx++}`;
       params.push(cycle_id);
     }
-    if (quarter && quarter !== 'null') {
+    if (quarter) {
       sql += ` AND quarter = $${idx++}`;
-      params.push(quarter);
+      params.push(parseInt(quarter));
+    }
+    if (period_type) {
+      sql += ` AND period_type = $${idx++}::period_type`;
+      params.push(period_type);
+    }
+    if (transition_id) {
+      sql += ` AND transition_id = $${idx++}`;
+      params.push(transition_id);
     }
 
-    sql += ' ORDER BY quarter ASC';
+    sql += ' ORDER BY quarter ASC, created_at DESC';
     const result = await query(sql, params);
     res.json({ data: result.rows });
   } catch (error) {
+    console.error('Error fetching quarterly self reviews:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// POST /api/evaluations/quarterly-self-reviews (upsert)
+// POST /api/evaluations/quarterly-self-reviews
 router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, quarter, overall_rating, overall_comments, status } = req.body;
-    
+    const { employee_id, cycle_id, quarter, overall_rating, overall_comments, status, period_type, transition_id, period_start_date, period_end_date } = req.body;
+
+    // Validate and parse quarter to integer
+    if (!quarter) {
+      return res.status(400).json({ error: 'quarter is required' });
+    }
+    const quarterNum = parseInt(quarter);
+    if (isNaN(quarterNum) || quarterNum < 1 || quarterNum > 4) {
+      return res.status(400).json({ error: 'quarter must be a number between 1 and 4' });
+    }
+
+    // Auto-detect transition if not explicitly provided
+    let periodType = period_type || 'full_quarter';
+    let transitionId = transition_id || null;
+    let periodStartDate = period_start_date || null;
+    let periodEndDate = period_end_date || null;
+
+    // If transition exists but period_type not provided, determine it based on current date
+    if (employee_id && cycle_id && !period_type && !transition_id) {
+      const transitionResult = await query(
+        `SELECT id, transition_date
+         FROM employee_quarter_transitions 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+        [employee_id, cycle_id, quarterNum]
+      );
+
+      if (transitionResult.rows.length > 0) {
+        const transition = transitionResult.rows[0];
+        transitionId = transition.id;
+        const transitionDate = new Date(transition.transition_date);
+        const now = new Date();
+        transitionDate.setHours(0, 0, 0, 0);
+
+        // Get quarter date range from quarterly_cycles table
+        const quarterRange = await query(
+          `SELECT quarter_start_date, quarter_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarterNum]
+        );
+
+        if (quarterRange.rows.length > 0) {
+          const quarterStart = new Date(quarterRange.rows[0].quarter_start_date);
+          const quarterEnd = new Date(quarterRange.rows[0].quarter_end_date);
+
+          if (now >= transitionDate) {
+            // Review is being created after transition, mark as post_transition
+            periodType = 'post_transition';
+            // Format transition date directly to avoid timezone issues
+            // transition.transition_date is already a date string from DB, use it directly
+            periodStartDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+            periodEndDate = quarterEnd.toISOString().split('T')[0];
+          } else {
+            // Review is being created before transition, mark as pre_transition
+            periodType = 'pre_transition';
+            periodStartDate = quarterStart.toISOString().split('T')[0];
+            // For pre-transition end date, use the transition date itself (not transition date - 1)
+            // Format transition date directly to avoid timezone issues
+            periodEndDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+          }
+        }
+      }
+    }
+
+    let goalsApproved = false;
+    if (periodType && periodType !== 'full_quarter' && transitionId) {
+      // Transition employee: check if goals for the specific period are approved
+      const goalsCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM goals 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND period_type = $4::period_type AND transition_id = $5 
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum, periodType, transitionId]
+      );
+      const goalsCount = parseInt(goalsCheck.rows[0]?.count || '0');
+
+      // Also check KRAs
+      const krasCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM kras 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND period_type = $4::period_type AND transition_id = $5 
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum, periodType, transitionId]
+      );
+      const krasCount = parseInt(krasCheck.rows[0]?.count || '0');
+
+      // For post-transition: if post-transition goals are not approved yet, 
+      // allow evaluation if pre-transition goals are approved
+      if (periodType === 'post_transition' && goalsCount === 0 && krasCount === 0) {
+        // Check if pre-transition goals are approved
+        const preGoalsCheck = await query(
+          `SELECT COUNT(*) as count 
+           FROM goals 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+             AND period_type = 'pre_transition'::period_type AND transition_id = $4 
+             AND status = 'approved'`,
+          [employee_id, cycle_id, quarterNum, transitionId]
+        );
+        const preKrasCheck = await query(
+          `SELECT COUNT(*) as count 
+           FROM kras 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+             AND period_type = 'pre_transition'::period_type AND transition_id = $4 
+             AND status = 'approved'`,
+          [employee_id, cycle_id, quarterNum, transitionId]
+        );
+        const preGoalsCount = parseInt(preGoalsCheck.rows[0]?.count || '0');
+        const preKrasCount = parseInt(preKrasCheck.rows[0]?.count || '0');
+        goalsApproved = (preGoalsCount > 0 || preKrasCount > 0);
+      } else {
+        goalsApproved = (goalsCount > 0 || krasCount > 0);
+      }
+    } else {
+      // Non-transition employee: check if any goals are approved
+      const goalsCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM goals 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR transition_id IS NULL)
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum]
+      );
+      const krasCheck = await query(
+        `SELECT COUNT(*) as count 
+         FROM kras 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3 
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR transition_id IS NULL)
+           AND status = 'approved'`,
+        [employee_id, cycle_id, quarterNum]
+      );
+      const goalsCount = parseInt(goalsCheck.rows[0]?.count || '0');
+      const krasCount = parseInt(krasCheck.rows[0]?.count || '0');
+      goalsApproved = (goalsCount > 0 || krasCount > 0);
+    }
+
+
+    // if (!goalsApproved) {
+    //   return res.status(400).json({ 
+    //     error: 'Goals must be approved by the manager before starting self-evaluation' 
+    //   });
+    // }
+
+    // Use the unique constraint that includes period_type and transition_id
+    // The constraint is: (employee_id, cycle_id, quarter, period_type, COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))
     const result = await query(
-      `INSERT INTO quarterly_self_reviews (id, employee_id, cycle_id, quarter, overall_rating, overall_comments, status, submitted_at, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
+      `INSERT INTO quarterly_self_reviews (
+        id, employee_id, cycle_id, quarter, overall_rating, overall_comments, status, 
+        period_type, transition_id, period_start_date, period_end_date,
+        submitted_at, created_at, updated_at
+      )
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7::period_type, $8, $9, $10, $11, NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter, period_type, (COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET
          overall_rating = EXCLUDED.overall_rating,
          overall_comments = EXCLUDED.overall_comments,
          status = EXCLUDED.status,
+         period_start_date = COALESCE(EXCLUDED.period_start_date, quarterly_self_reviews.period_start_date),
+         period_end_date = COALESCE(EXCLUDED.period_end_date, quarterly_self_reviews.period_end_date),
          submitted_at = CASE WHEN EXCLUDED.status = 'submitted' THEN NOW() ELSE quarterly_self_reviews.submitted_at END,
          updated_at = NOW()
        RETURNING *`,
       [
         employee_id ?? null,
         cycle_id ?? null,
-        quarter ?? null,
+        quarterNum, // Use parsed integer, not raw quarter
         overall_rating ?? null,
         overall_comments ?? null,
         status || 'pending',
+        periodType,
+        transitionId,
+        periodStartDate,
+        periodEndDate,
         status === 'submitted' ? new Date() : null
       ]
     );
-    res.json({ data: result.rows[0] });
+
+    // If status is 'submitted', mark any active rejections for this quarter as resubmitted
+    // This allows the evaluation to proceed back to manager review
+    if (status === 'submitted') {
+      await query(
+        `UPDATE kra_kpi_rejections 
+         SET resubmitted_at = NOW(), updated_at = NOW()
+         WHERE employee_id = $1
+           AND cycle_id = $2
+           AND quarter = $3
+           AND resubmitted_at IS NULL`,
+        [employee_id, cycle_id, quarterNum]
+      );
+    }
+    // Return response with transition info for frontend date validation bypass
+    const responseData = result.rows[0];
+
+    // Check if transition_id was provided in the request (special case - always allow)
+    const transitionIdProvided = transition_id !== undefined && transition_id !== null;
+
+    if (transitionIdProvided) {
+      // If transition_id is explicitly provided in payload, allow it (special case)
+      responseData.has_active_transition = true;
+      responseData.date_validation_bypassed = true;
+    } else {
+      // transition_id was NOT provided in payload
+      // Check if employee has a transition in the employee_quarter_transitions table
+      const transitionCheck = await query(
+        `SELECT id FROM employee_quarter_transitions 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+        [employee_id, cycle_id, quarterNum]
+      );
+
+      if (transitionCheck.rows.length > 0) {
+        // Employee has transition in table, allow it (bypass date restrictions for transition employees)
+        responseData.has_active_transition = true;
+        responseData.date_validation_bypassed = true;
+      } else {
+        // No transition found - this is a normal (non-transition) employee
+        // For non-transition employees, check if current date is within self-review period dates
+        // This is the normal validation flow for regular employees
+        const quarterlyCycleResult = await query(
+          `SELECT self_review_start_date, self_review_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarterNum]
+        );
+
+        if (quarterlyCycleResult.rows.length > 0) {
+          const quarterlyCycle = quarterlyCycleResult.rows[0];
+          const selfReviewStart = quarterlyCycle.self_review_start_date;
+          const selfReviewEnd = quarterlyCycle.self_review_end_date;
+
+          if (selfReviewStart && selfReviewEnd) {
+            const now = new Date();
+            now.setHours(0, 0, 0, 0);
+            const startDate = new Date(selfReviewStart);
+            startDate.setHours(0, 0, 0, 0);
+            const endDate = new Date(selfReviewEnd);
+            endDate.setHours(23, 59, 59, 999);
+
+            // Check if current date is within self-review period
+            if (now < startDate || now > endDate) {
+              return res.status(400).json({
+                error: 'Self-review period is not open. Please check the review period dates.'
+              });
+            }
+          }
+        }
+
+        // For non-transition employees, normal validation passed (goals approved + within review period)
+        // No need to set has_active_transition or date_validation_bypassed
+      }
+    }
+
+    res.json({ data: responseData });
   } catch (error) {
+    console.error('Error creating/updating quarterly self review:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -221,7 +558,7 @@ router.post('/quarterly-self-reviews', authMiddleware, async (req, res) => {
 router.get('/quarterly-kpi-progress', authMiddleware, async (req, res) => {
   try {
     const { quarterly_review_id } = req.query;
-    
+
     let sql = 'SELECT * FROM quarterly_kpi_progress WHERE 1=1';
     const params = [];
     let idx = 1;
@@ -242,7 +579,7 @@ router.get('/quarterly-kpi-progress', authMiddleware, async (req, res) => {
 router.post('/quarterly-kpi-progress', authMiddleware, async (req, res) => {
   try {
     const { quarterly_review_id, goal_id, progress_percentage, achievement_to_date, challenges, self_rating } = req.body;
-    
+
     const result = await query(
       `INSERT INTO quarterly_kpi_progress (id, quarterly_review_id, goal_id, progress_percentage, achievement_to_date, challenges, self_rating, created_at, updated_at)
        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), NOW())
@@ -310,11 +647,26 @@ router.post('/quarterly-kpi-progress/bulk', authMiddleware, async (req, res) => 
   }
 });
 
+// ========== QUARTERLY MANAGER REVIEWS ==========
+
 // GET /api/evaluations/quarterly-manager-reviews
 router.get('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, quarter } = req.query;
-    
+    const { employee_id, cycle_id, quarter, period_type, transition_id } = req.query;
+
+    // Get current user's employee ID (for manager role check)
+    let managerId = null;
+    if (employee_id && cycle_id && quarter) {
+      // Only check manager role if viewing another employee's data
+      const empResult = await query(
+        'SELECT id FROM employees WHERE profile_id = $1',
+        [req.user.userId]
+      );
+      if (empResult.rows.length > 0) {
+        managerId = empResult.rows[0].id;
+      }
+    }
+
     let sql = 'SELECT * FROM quarterly_manager_reviews WHERE 1=1';
     const params = [];
     let idx = 1;
@@ -329,7 +681,33 @@ router.get('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
     }
     if (quarter && quarter !== 'null') {
       sql += ` AND quarter = $${idx++}`;
-      params.push(quarter);
+      params.push(parseInt(quarter));
+    }
+    if (period_type) {
+      sql += ` AND period_type = $${idx++}::period_type`;
+      params.push(period_type);
+    }
+    if (transition_id) {
+      sql += ` AND transition_id = $${idx++}`;
+      params.push(transition_id);
+    }
+
+    // Apply manager role filtering ONLY if period_type and transition_id are NOT specified
+    // If period_type/transition_id are specified, we want to fetch that specific review regardless of manager role
+    // This allows checking submission status for both pre and post-transition reviews
+    if (!period_type && !transition_id && managerId && employee_id && cycle_id && quarter && employee_id !== managerId) {
+      const managerRole = await getManagerRoleForTransition(managerId, employee_id, cycle_id, parseInt(quarter));
+
+      if (managerRole === 'old_manager') {
+        // Old manager: only pre-transition reviews
+        sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'pre_transition'::period_type)`;
+      } else if (managerRole === 'new_manager') {
+        // New manager: only post-transition reviews
+        sql += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type OR period_type = 'post_transition'::period_type)`;
+      } else if (managerRole === 'same_manager') {
+        // Same manager: both pre and post-transition (no additional filter needed)
+      }
+      // If managerRole is null, user is not involved in transition, show all data
     }
 
     sql += ' ORDER BY quarter ASC';
@@ -344,7 +722,7 @@ router.get('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
 router.get('/quarterly-manager-reviews/count', authMiddleware, async (req, res) => {
   try {
     const { cycle_id, reviewer_id, status } = req.query;
-    
+
     let sql = 'SELECT COUNT(*) as count FROM quarterly_manager_reviews WHERE 1=1';
     const params = [];
     let idx = 1;
@@ -372,55 +750,216 @@ router.get('/quarterly-manager-reviews/count', authMiddleware, async (req, res) 
 // POST /api/evaluations/quarterly-manager-reviews (upsert)
 router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
   try {
-    const { employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, status, calculated_overall_rating } = req.body;
-    
+    const { employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, status, calculated_overall_rating, period_type, transition_id, period_start_date, period_end_date } = req.body;
+
+    // Validate and parse quarter to integer
+    if (!quarter) {
+      return res.status(400).json({ error: 'quarter is required' });
+    }
+    const quarterNum = parseInt(quarter);
+    if (isNaN(quarterNum) || quarterNum < 1 || quarterNum > 4) {
+      return res.status(400).json({ error: 'quarter must be a number between 1 and 4' });
+    }
+
+    // Check if review is already submitted for this period (prevent resubmission)
+    if (status === 'submitted' && employee_id && cycle_id) {
+      let existingReviewQuery = `
+        SELECT id, status, period_type, transition_id
+        FROM quarterly_manager_reviews
+        WHERE employee_id = $1 
+          AND cycle_id = $2 
+          AND quarter = $3
+      `;
+      const existingParams = [employee_id, cycle_id, quarterNum];
+      let paramIdx = 4;
+
+      // For transition employees, check specific period
+      if (period_type && transition_id) {
+        existingReviewQuery += ` AND period_type = $${paramIdx}::period_type AND transition_id = $${paramIdx + 1}`;
+        existingParams.push(period_type, transition_id);
+      } else if (period_type) {
+        existingReviewQuery += ` AND period_type = $${paramIdx}::period_type`;
+        existingParams.push(period_type);
+      } else {
+        existingReviewQuery += ` AND (period_type IS NULL OR period_type = 'full_quarter'::period_type)`;
+      }
+
+      existingReviewQuery += ` AND status = 'submitted' LIMIT 1`;
+
+      const existingReview = await query(existingReviewQuery, existingParams);
+
+      if (existingReview.rows.length > 0) {
+        return res.status(400).json({
+          error: 'Review already submitted for this period',
+          message: 'This review has already been submitted. Please contact HR if you need to make changes.',
+          review_id: existingReview.rows[0].id
+        });
+      }
+    }
+
+    // Auto-detect transition if not explicitly provided
+    let periodType = period_type || 'full_quarter';
+    let transitionId = transition_id || null;
+    let periodStartDate = period_start_date || null;
+    let periodEndDate = period_end_date || null;
+
+    // If transition exists but period_type not provided, determine it based on current date
+    if (employee_id && cycle_id && !period_type && !transition_id) {
+      const transitionResult = await query(
+        `SELECT id, transition_date, old_manager_id, new_manager_id
+         FROM employee_quarter_transitions 
+         WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+        [employee_id, cycle_id, quarterNum]
+      );
+
+      if (transitionResult.rows.length > 0) {
+        const transition = transitionResult.rows[0];
+        transitionId = transition.id;
+        const transitionDate = new Date(transition.transition_date);
+        const now = new Date();
+        transitionDate.setHours(0, 0, 0, 0);
+
+        // Get quarter date range from quarterly_cycles table
+        const quarterRange = await query(
+          `SELECT quarter_start_date, quarter_end_date 
+           FROM quarterly_cycles 
+           WHERE performance_cycle_id = $1 AND quarter = $2`,
+          [cycle_id, quarter]
+        );
+
+        if (quarterRange.rows.length > 0) {
+          const quarterStart = new Date(quarterRange.rows[0].quarter_start_date);
+          const quarterEnd = new Date(quarterRange.rows[0].quarter_end_date);
+
+          // Determine period based on reviewer - old manager reviews pre, new manager reviews post
+          if (reviewer_id && transition.old_manager_id && reviewer_id === transition.old_manager_id) {
+            periodType = 'pre_transition';
+            periodStartDate = quarterStart.toISOString().split('T')[0];
+            // For pre-transition end date, use the transition date itself (not transition date - 1)
+            // Format transition date directly to avoid timezone issues
+            periodEndDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+          } else if (reviewer_id && transition.new_manager_id && reviewer_id === transition.new_manager_id) {
+            periodType = 'post_transition';
+            // Format transition date directly to avoid timezone issues
+            periodStartDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+            periodEndDate = quarterEnd.toISOString().split('T')[0];
+          } else if (now >= transitionDate) {
+            // Default: if after transition date, assume post-transition
+            periodType = 'post_transition';
+            // Format transition date directly to avoid timezone issues
+            periodStartDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+            periodEndDate = quarterEnd.toISOString().split('T')[0];
+          } else {
+            // Default: if before transition date, assume pre-transition
+            periodType = 'pre_transition';
+            periodStartDate = quarterStart.toISOString().split('T')[0];
+            // For pre-transition end date, use the transition date itself (not transition date - 1)
+            // Format transition date directly to avoid timezone issues
+            periodEndDate = transition.transition_date instanceof Date
+              ? transition.transition_date.toISOString().split('T')[0]
+              : (typeof transition.transition_date === 'string'
+                ? transition.transition_date.split('T')[0]
+                : transitionDate.toISOString().split('T')[0]);
+          }
+        }
+      }
+    }
+
     // Check if user is manager or delegate
-    if (employee_id && cycle_id && quarter) {
+    if (employee_id && cycle_id) {
       const auth = await checkManagerOrDelegate(
         req.user.userId,
         employee_id,
         cycle_id,
-        parseInt(quarter)
+        quarterNum
       );
-      
+
       if (!auth.isAuthorized) {
         return res.status(403).json({ error: 'Not authorized to submit review for this employee' });
       }
     }
-    
+
+    // For transition employees: Don't calculate average here
+    // The average (pre-transition HR approved + post-transition) will be calculated during normalization
+    // Store only the post-transition rating in calculated_overall_rating
+    let finalCalculatedRating = calculated_overall_rating;
+
+    // Check for active rejections if trying to submit
+    // If there are active rejections (not resubmitted), prevent submission
+    let finalStatus = status || 'pending';
+    if (finalStatus === 'submitted') {
+      const activeRejectionsCheck = await query(
+        `SELECT COUNT(*) as count FROM kra_kpi_rejections
+         WHERE employee_id = $1
+           AND cycle_id = $2
+           AND quarter = $3
+           AND resubmitted_at IS NULL`,
+        [employee_id, cycle_id, quarterNum]
+      );
+
+      if (activeRejectionsCheck.rows.length > 0 && parseInt(activeRejectionsCheck.rows[0].count) > 0) {
+        // There are active rejections - cannot submit, must remain in_progress
+        finalStatus = 'in_progress';
+      }
+    }
+
     // Upsert quarterly manager review
+    // Use the unique constraint that includes period_type and transition_id
+    // The constraint is: (employee_id, cycle_id, quarter, period_type, COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))
     const result = await query(
-      `INSERT INTO quarterly_manager_reviews (id, employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, calculated_overall_rating, status, approved_at, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
+      `INSERT INTO quarterly_manager_reviews (
+        id, employee_id, cycle_id, quarter, reviewer_id, overall_comments, guidance, 
+        calculated_overall_rating, status, period_type, transition_id, period_start_date, period_end_date,
+        approved_at, created_at, updated_at
+      )
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9::period_type, $10, $11, $12, $13, NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter, period_type, (COALESCE(transition_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET
          overall_comments = EXCLUDED.overall_comments,
          guidance = EXCLUDED.guidance,
          calculated_overall_rating = EXCLUDED.calculated_overall_rating,
          status = EXCLUDED.status,
+         period_start_date = COALESCE(EXCLUDED.period_start_date, quarterly_manager_reviews.period_start_date),
+         period_end_date = COALESCE(EXCLUDED.period_end_date, quarterly_manager_reviews.period_end_date),
          approved_at = CASE WHEN EXCLUDED.status = 'submitted' THEN NOW() ELSE quarterly_manager_reviews.approved_at END,
          updated_at = NOW()
        RETURNING *`,
       [
         employee_id ?? null,
         cycle_id ?? null,
-        quarter ?? null,
+        quarterNum, // Use parsed integer, not raw quarter
         reviewer_id ?? null,
         overall_comments ?? null,
         guidance ?? null,
-        calculated_overall_rating ?? null,
-        status || 'pending',
-        status === 'submitted' ? new Date() : null
+        finalCalculatedRating ?? null,
+        finalStatus,
+        periodType,
+        transitionId,
+        periodStartDate,
+        periodEndDate,
+        finalStatus === 'submitted' ? new Date() : null
       ]
     );
 
     // Also upsert into manager_evaluations table with quarterly rating
-    if (employee_id && cycle_id && reviewer_id && quarter) {
-      const quarterNum = parseInt(quarter);
-      const quarterRating = calculated_overall_rating ?? null;
-      
+    if (employee_id && cycle_id && reviewer_id) {
+      // Use aggregated rating if it was calculated
+      const quarterRating = finalCalculatedRating ?? calculated_overall_rating ?? null;
+
       // Build dynamic column name for the quarter rating
       const quarterColumn = `q${quarterNum}_rating`;
-      
+
       // Check if manager_evaluation exists for this employee/cycle
       const existingEval = await query(
         `SELECT id, q1_rating, q2_rating, q3_rating, q4_rating FROM manager_evaluations 
@@ -455,7 +994,7 @@ router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
            WHERE employee_id = $1 AND cycle_id = $2`,
           [employee_id, cycle_id]
         );
-        
+
         if (updatedEval.rows.length > 0) {
           const row = updatedEval.rows[0];
           const ratings = [row.q1_rating, row.q2_rating, row.q3_rating, row.q4_rating].filter(r => r !== null);
@@ -487,7 +1026,58 @@ router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
       }
     }
 
-    res.json({ data: result.rows[0] });
+    // Return response with transition info for frontend date validation bypass
+    const responseData = result.rows[0];
+
+    // Check if transition_id or period_type is provided
+    if (transitionId || period_type) {
+      let shouldAllow = false;
+
+      if (transitionId) {
+        // If transition_id is provided, check if it exists in employee_quarter_transitions table
+        const transitionCheck = await query(
+          `SELECT id FROM employee_quarter_transitions 
+           WHERE id = $1 AND employee_id = $2 AND cycle_id = $3 AND quarter = $4`,
+          [transitionId, employee_id, cycle_id, quarterNum]
+        );
+
+        if (transitionCheck.rows.length > 0) {
+          // Transition exists in table - allow it
+          shouldAllow = true;
+        }
+      } else if (period_type && (period_type === 'pre_transition' || period_type === 'post_transition')) {
+        // If period_type is provided (and transition_id is not), check if employee has a transition
+        const transitionCheck = await query(
+          `SELECT id FROM employee_quarter_transitions 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3`,
+          [employee_id, cycle_id, quarterNum]
+        );
+
+        if (transitionCheck.rows.length > 0) {
+          // Employee has a transition in table - allow it
+          shouldAllow = true;
+        }
+      }
+
+      if (shouldAllow) {
+        responseData.has_active_transition = true;
+        responseData.date_validation_bypassed = true; // Frontend can use this to bypass date checks
+      } else {
+        // Transition doesn't exist in table or validation failed - apply original validation
+        const canPerform = await canPerformTransitionActions(employee_id, cycle_id, quarterNum);
+        if (canPerform) {
+          responseData.has_active_transition = true;
+          responseData.date_validation_bypassed = true;
+        } else {
+          // Transition exists but we're outside quarter dates - don't allow
+          return res.status(400).json({
+            error: 'Actions for employees with transitions are only allowed within the current quarter dates'
+          });
+        }
+      }
+    }
+
+    res.json({ data: responseData });
   } catch (error) {
     console.error('Quarterly manager review upsert error:', error);
     res.status(500).json({ error: error.message });
@@ -499,8 +1089,8 @@ router.post('/quarterly-manager-reviews', authMiddleware, async (req, res) => {
 // GET /api/evaluations/quarterly-kpi-manager-feedback
 router.get('/quarterly-kpi-manager-feedback', authMiddleware, async (req, res) => {
   try {
-    const { manager_review_id } = req.query;
-    
+    const { manager_review_id, goal_id } = req.query;
+
     let sql = 'SELECT * FROM quarterly_kpi_manager_feedback WHERE 1=1';
     const params = [];
     let idx = 1;
@@ -509,10 +1099,16 @@ router.get('/quarterly-kpi-manager-feedback', authMiddleware, async (req, res) =
       sql += ` AND manager_review_id = $${idx++}`;
       params.push(manager_review_id);
     }
+    if (goal_id) {
+      sql += ` AND goal_id = $${idx++}`;
+      params.push(goal_id);
+    }
 
+    sql += ' ORDER BY created_at DESC';
     const result = await query(sql, params);
     res.json({ data: result.rows });
   } catch (error) {
+    console.error('Error fetching quarterly KPI manager feedback:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -520,15 +1116,16 @@ router.get('/quarterly-kpi-manager-feedback', authMiddleware, async (req, res) =
 // POST /api/evaluations/quarterly-kpi-manager-feedback (upsert)
 router.post('/quarterly-kpi-manager-feedback', authMiddleware, async (req, res) => {
   try {
-    const { manager_review_id, goal_id, rating, comments, manager_achieved_value, progress_percentage } = req.body;
-    
+    const { manager_review_id, goal_id, rating, comments, manager_achieved_value, progress_percentage, evidence } = req.body;
+
     const result = await query(
-      `INSERT INTO quarterly_kpi_manager_feedback (id, manager_review_id, goal_id, rating, comments, progress_percentage, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW(), NOW())
+      `INSERT INTO quarterly_kpi_manager_feedback (id, manager_review_id, goal_id, rating, comments, progress_percentage, evidence, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), NOW())
        ON CONFLICT (manager_review_id, goal_id) DO UPDATE SET
          rating = EXCLUDED.rating,
          comments = EXCLUDED.comments,
          progress_percentage = EXCLUDED.progress_percentage,
+         evidence = EXCLUDED.evidence,
          updated_at = NOW()
        RETURNING *`,
       [
@@ -536,7 +1133,8 @@ router.post('/quarterly-kpi-manager-feedback', authMiddleware, async (req, res) 
         goal_id ?? null,
         rating ?? null,
         comments ?? null,
-        progress_percentage ?? null
+        progress_percentage ?? null,
+        evidence ?? null
       ]
     );
     res.json({ data: result.rows[0] });
@@ -557,12 +1155,13 @@ router.post('/quarterly-kpi-manager-feedback/bulk', authMiddleware, async (req, 
     const results = [];
     for (const item of ratings) {
       const result = await query(
-        `INSERT INTO quarterly_kpi_manager_feedback (id, manager_review_id, goal_id, rating, comments, progress_percentage, created_at, updated_at)
-         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW(), NOW())
+        `INSERT INTO quarterly_kpi_manager_feedback (id, manager_review_id, goal_id, rating, comments, progress_percentage, evidence, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), NOW())
          ON CONFLICT (manager_review_id, goal_id) DO UPDATE SET
            rating = EXCLUDED.rating,
            comments = EXCLUDED.comments,
            progress_percentage = EXCLUDED.progress_percentage,
+           evidence = EXCLUDED.evidence,
            updated_at = NOW()
          RETURNING *`,
         [
@@ -570,7 +1169,8 @@ router.post('/quarterly-kpi-manager-feedback/bulk', authMiddleware, async (req, 
           item.goal_id ?? null,
           item.rating ?? null,
           item.comments ?? null,
-          item.progress_percentage ?? null
+          item.progress_percentage ?? null,
+          item.evidence ?? null
         ]
       );
       if (result.rows[0]) {
@@ -585,50 +1185,447 @@ router.post('/quarterly-kpi-manager-feedback/bulk', authMiddleware, async (req, 
   }
 });
 
-// ========== COMPETENCY RATINGS ==========
+// ========== KRA/KPI REJECTION WORKFLOW ==========
 
-// GET /api/evaluations/competency-self-ratings
-router.get('/competency-self-ratings', authMiddleware, async (req, res) => {
+// GET /api/evaluations/kra-kpi-rejections
+// Get rejection status for KRAs/KPIs for a given manager review or employee/quarter
+router.get('/kra-kpi-rejections', authMiddleware, async (req, res) => {
   try {
-    const { self_evaluation_id } = req.query;
-    
-    let sql = 'SELECT * FROM competency_self_ratings WHERE 1=1';
+    const { manager_review_id, employee_id, cycle_id, quarter, kra_id, goal_id } = req.query;
+
+    let sql = `
+      SELECT 
+        kkr.*,
+        k.title as kra_title,
+        g.title as goal_title
+      FROM kra_kpi_rejections kkr
+      LEFT JOIN kras k ON k.id = kkr.kra_id
+      LEFT JOIN goals g ON g.id = kkr.goal_id
+      WHERE 1=1
+    `;
     const params = [];
     let idx = 1;
 
-    if (self_evaluation_id) {
-      sql += ` AND self_evaluation_id = $${idx++}`;
-      params.push(self_evaluation_id);
+    if (manager_review_id) {
+      sql += ` AND kkr.manager_review_id = $${idx++}`;
+      params.push(manager_review_id);
+    }
+    if (employee_id) {
+      sql += ` AND kkr.employee_id = $${idx++}`;
+      params.push(employee_id);
+    }
+    if (cycle_id) {
+      sql += ` AND kkr.cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+    if (quarter) {
+      sql += ` AND kkr.quarter = $${idx++}`;
+      params.push(parseInt(quarter));
+    }
+    if (kra_id) {
+      sql += ` AND kkr.kra_id = $${idx++}`;
+      params.push(kra_id);
+    }
+    if (goal_id) {
+      sql += ` AND kkr.goal_id = $${idx++}`;
+      params.push(goal_id);
     }
 
+    sql += ' ORDER BY kkr.rejected_at DESC';
     const result = await query(sql, params);
     res.json({ data: result.rows });
   } catch (error) {
+    console.error('Error fetching KRA/KPI rejections:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// POST /api/evaluations/competency-self-ratings (upsert)
-router.post('/competency-self-ratings', authMiddleware, async (req, res) => {
+// POST /api/evaluations/reject-kra-kpi
+// Manager rejects a specific KRA or KPI
+router.post('/reject-kra-kpi', authMiddleware, async (req, res) => {
   try {
-    const { self_evaluation_id, competency_id, rating, comments } = req.body;
-    
-    const result = await query(
-      `INSERT INTO competency_self_ratings (id, self_evaluation_id, competency_id, rating, comments, created_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW())
-       ON CONFLICT (self_evaluation_id, competency_id) DO UPDATE SET
-         rating = EXCLUDED.rating,
-         comments = EXCLUDED.comments
-       RETURNING *`,
-      [
-        self_evaluation_id ?? null,
-        competency_id ?? null,
-        rating ?? null,
-        comments ?? null
-      ]
+    const { manager_review_id, kra_id, goal_id, rejection_reason, quarter, cycle_id, employee_id, rejection_documents } = req.body;
+    console.log('[Reject KRA/KPI] Full request body:', JSON.stringify(req.body, null, 2));
+    console.log('[Reject KRA/KPI] rejection_documents extracted:', {
+      value: rejection_documents,
+      type: typeof rejection_documents,
+      isUndefined: rejection_documents === undefined,
+      isNull: rejection_documents === null,
+      isString: typeof rejection_documents === 'string',
+      stringLength: typeof rejection_documents === 'string' ? rejection_documents.length : 'N/A'
+    });
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_review_id || !rejection_reason || !quarter || !cycle_id || !employee_id) {
+      return res.status(400).json({ error: 'manager_review_id, rejection_reason, quarter, cycle_id, and employee_id are required' });
+    }
+
+    if (!kra_id && !goal_id) {
+      return res.status(400).json({ error: 'Either kra_id or goal_id must be provided' });
+    }
+
+    if (kra_id && goal_id) {
+      return res.status(400).json({ error: 'Cannot reject both KRA and KPI in the same request' });
+    }
+
+    // Get current user's employee ID
+    const currentUserEmpResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
     );
+
+    if (currentUserEmpResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Current user employee record not found' });
+    }
+
+    const rejectedBy = currentUserEmpResult.rows[0].id;
+
+    // Verify manager is authorized to reject (must be the reviewer of the manager review)
+    const reviewCheck = await query(
+      'SELECT reviewer_id FROM quarterly_manager_reviews WHERE id = $1',
+      [manager_review_id]
+    );
+
+    if (reviewCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Manager review not found' });
+    }
+
+    if (reviewCheck.rows[0].reviewer_id !== rejectedBy) {
+      // Check for delegation
+      const delegationCheck = await query(
+        `SELECT 1 FROM delegations
+         WHERE delegate_id = $1
+           AND reportee_id = $2
+           AND cycle_id = $3
+           AND (quarter = $4 OR quarter IS NULL)
+           AND revoked_at IS NULL`,
+        [rejectedBy, employee_id, cycle_id, parseInt(quarter)]
+      );
+
+      if (delegationCheck.rows.length === 0) {
+        return res.status(403).json({ error: 'Not authorized to reject this KRA/KPI' });
+      }
+    }
+
+    // Determine final kra_id and goal_id values for storage
+    // Note: Constraint requires either kra_id OR goal_id, not both
+    let finalKraId = kra_id || null;
+    let finalGoalId = goal_id || null;
+
+    // For duplicate checking, we may need the kra_id even when rejecting a KPI
+    let kraIdForCheck = finalKraId;
+
+    // Verify the KRA or KPI exists
+    if (finalGoalId) {
+      // Verify KPI exists and get its kra_id for duplicate checking
+      const kpiCheck = await query(
+        'SELECT id, kra_id FROM goals WHERE id = $1',
+        [finalGoalId]
+      );
+
+      if (kpiCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'KPI not found' });
+      }
+
+      // Store kra_id for duplicate check (but don't store it in DB - constraint requires only goal_id)
+      kraIdForCheck = kpiCheck.rows[0].kra_id;
+      // Ensure finalKraId is null when rejecting a KPI (constraint requirement)
+      finalKraId = null;
+    }
+
+    if (finalKraId && !finalGoalId) {
+      // Verify KRA exists (only if we're rejecting a KRA directly, not a KPI)
+      const kraCheck = await query(
+        'SELECT id FROM kras WHERE id = $1',
+        [finalKraId]
+      );
+
+      if (kraCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'KRA not found' });
+      }
+      // Ensure finalGoalId is null when rejecting a KRA (constraint requirement)
+      finalGoalId = null;
+    }
+
+
+    let existingRejectionCheck;
+    if (finalGoalId) {
+      // Rejecting a KPI - check by goal_id
+      existingRejectionCheck = await query(
+        ` SELECT 1
+          FROM kra_kpi_rejections
+          WHERE employee_id = $1
+            AND cycle_id = $2
+            AND quarter = $3
+            AND rejected_by = $4
+            AND goal_id = $5
+            AND rejected_at IS not NULL
+            AND resubmitted_at IS not NULL
+          LIMIT 1
+  `,
+        [
+          employee_id,
+          cycle_id,
+          Number(quarter),
+          rejectedBy,
+          finalGoalId
+        ]
+      );
+    } else if (finalKraId) {
+      // Rejecting a KRA - check by kra_id
+      existingRejectionCheck = await query(
+        `SELECT 1 FROM kra_kpi_rejections
+         WHERE employee_id = $1
+           AND cycle_id = $2
+           AND quarter = $3
+           AND rejected_by = $4
+           AND kra_id = $5
+           AND rejected_at IS not NULL
+            AND resubmitted_at IS not NULL
+         LIMIT 1`,
+        [
+          employee_id,
+          cycle_id,
+          parseInt(quarter),
+          rejectedBy,
+          finalKraId
+        ]
+      );
+    } else {
+      return res.status(400).json({ error: 'Either kra_id or goal_id must be provided' });
+    }
+    
+    if (existingRejectionCheck && existingRejectionCheck.rows && existingRejectionCheck.rows.length > 0) {
+      return res.status(400).json({
+        error: 'This KRA/KPI has already been rejected once in this quarter. Cannot reject again.',
+        hint: 'A manager can only reject a specific KRA/KPI once per quarter. After employee resubmission, manager must accept or proceed with evaluation.'
+      });
+    }
+
+    // Create rejection record
+    // Note: Constraint requires either kra_id OR goal_id, not both
+    // For KPI rejections: store only goal_id (kra_id = NULL)
+    // For KRA rejections: store only kra_id (goal_id = NULL)
+    // Also handle unique constraint violation at database level as a safety net
+    let rejectionResult;
+    try {
+      console.log('[Reject KRA/KPI] Inserting rejection with documents:', {
+        rejection_documents,
+        type: typeof rejection_documents,
+        length: rejection_documents ? rejection_documents.length : 0
+      });
+      
+      // Ensure rejection_documents is a valid JSON string or null
+      let documentsValue = null;
+      if (rejection_documents !== undefined && rejection_documents !== null) {
+        console.log('[Reject KRA/KPI] Processing rejection_documents:', {
+          value: rejection_documents,
+          type: typeof rejection_documents,
+          isString: typeof rejection_documents === 'string',
+          isArray: Array.isArray(rejection_documents),
+          length: typeof rejection_documents === 'string' ? rejection_documents.length : (Array.isArray(rejection_documents) ? rejection_documents.length : 'N/A')
+        });
+        
+        // If it's already a string, use it; otherwise stringify it
+        if (typeof rejection_documents === 'string') {
+          const trimmed = rejection_documents.trim();
+          // Only store if it's not an empty string or empty array JSON
+          if (trimmed && trimmed !== '[]' && trimmed !== '""' && trimmed !== 'null') {
+            // Try to parse it to validate it's valid JSON
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (Array.isArray(parsed) && parsed.length > 0) {
+                documentsValue = trimmed; // Store the original JSON string
+                console.log('[Reject KRA/KPI] Valid JSON array found, storing:', documentsValue);
+              } else {
+                console.warn('[Reject KRA/KPI] Parsed JSON is not a non-empty array:', parsed);
+              }
+            } catch (parseError) {
+              console.error('[Reject KRA/KPI] Failed to parse rejection_documents as JSON:', parseError);
+              console.error('[Reject KRA/KPI] Raw value:', trimmed);
+            }
+          } else {
+            console.warn('[Reject KRA/KPI] rejection_documents is empty or invalid:', trimmed);
+          }
+        } else if (Array.isArray(rejection_documents) && rejection_documents.length > 0) {
+          documentsValue = JSON.stringify(rejection_documents);
+          console.log('[Reject KRA/KPI] Array provided, stringified:', documentsValue);
+        } else if (typeof rejection_documents === 'object' && rejection_documents !== null) {
+          documentsValue = JSON.stringify(rejection_documents);
+          console.log('[Reject KRA/KPI] Object provided, stringified:', documentsValue);
+        } else {
+          console.warn('[Reject KRA/KPI] rejection_documents is in unexpected format:', rejection_documents);
+        }
+      } else {
+        console.log('[Reject KRA/KPI] rejection_documents is undefined or null, storing null');
+      }
+      
+      console.log('[Reject KRA/KPI] Final documents value to insert:', documentsValue);
+      
+      rejectionResult = await query(
+        `INSERT INTO kra_kpi_rejections 
+         (id, manager_review_id, kra_id, goal_id, quarter, cycle_id, employee_id, rejected_by, rejection_reason, rejection_documents, rejected_at, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW(), NOW())
+         RETURNING *`,
+        [
+          manager_review_id,
+          finalKraId,  // NULL for KPI rejections, actual value for KRA rejections
+          finalGoalId, // NULL for KRA rejections, actual value for KPI rejections
+          parseInt(quarter),
+          cycle_id,
+          employee_id,
+          rejectedBy,
+          rejection_reason,
+          documentsValue
+        ]
+      );
+      console.log('[Reject KRA/KPI] Insert result:', {
+        id: rejectionResult.rows[0]?.id,
+        rejection_documents: rejectionResult.rows[0]?.rejection_documents,
+        rejection_documents_type: typeof rejectionResult.rows[0]?.rejection_documents
+      });
+    } catch (dbError) {
+      // Handle unique constraint violation at database level
+      if (dbError.code === '23505' || dbError.message?.includes('unique') || dbError.message?.includes('duplicate')) {
+        return res.status(400).json({
+          error: 'This KRA/KPI has already been rejected once in this quarter. Cannot reject again.',
+          hint: 'A manager can only reject a specific KRA/KPI once per quarter. After employee resubmission, manager must accept or proceed with evaluation.',
+          details: 'Database constraint violation detected'
+        });
+      }
+      throw dbError; // Re-throw if it's a different error
+    }
+
+    // Update manager review status to 'in_progress' if it was 'submitted'
+    // This prevents it from moving to HR review until resubmission
+    await query(
+      `UPDATE quarterly_manager_reviews 
+       SET status = 'in_progress', updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted'`,
+      [manager_review_id]
+    );
+
+    // Update employee's self-evaluation status to 'in_progress' if it was 'submitted'
+    // This allows the employee to edit the rejected items
+    // For transition employees, we need to match by period_type and transition_id
+    // First, get the manager review to find period_type and transition_id
+    const managerReviewResult = await query(
+      `SELECT period_type, transition_id FROM quarterly_manager_reviews WHERE id = $1`,
+      [manager_review_id]
+    );
+
+    if (managerReviewResult.rows.length > 0) {
+      const managerReview = managerReviewResult.rows[0];
+      let selfReviewUpdateQuery;
+      let selfReviewUpdateParams;
+
+      if (managerReview.period_type && managerReview.transition_id) {
+        // Transition employee - match by period_type and transition_id
+        selfReviewUpdateQuery = `
+          UPDATE quarterly_self_reviews 
+          SET status = 'in_progress', updated_at = NOW()
+          WHERE employee_id = $1
+            AND cycle_id = $2
+            AND quarter = $3
+            AND period_type = $4::period_type
+            AND transition_id = $5
+            AND status = 'submitted'`;
+        selfReviewUpdateParams = [
+          employee_id,
+          cycle_id,
+          parseInt(quarter),
+          managerReview.period_type,
+          managerReview.transition_id
+        ];
+      } else {
+        // Regular employee - match by employee_id, cycle_id, quarter (no period_type/transition_id)
+        selfReviewUpdateQuery = `
+          UPDATE quarterly_self_reviews 
+          SET status = 'in_progress', updated_at = NOW()
+          WHERE employee_id = $1
+            AND cycle_id = $2
+            AND quarter = $3
+            AND (period_type IS NULL OR period_type = 'full_quarter'::period_type)
+            AND transition_id IS NULL
+            AND status = 'submitted'`;
+        selfReviewUpdateParams = [
+          employee_id,
+          cycle_id,
+          parseInt(quarter)
+        ];
+      }
+
+      await query(selfReviewUpdateQuery, selfReviewUpdateParams);
+    }
+
+    res.json({ data: rejectionResult.rows[0] });
+  } catch (error) {
+    console.error('Error rejecting KRA/KPI:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/resubmit-kra-kpi
+// Mark rejected KRA/KPI as resubmitted when employee updates it
+router.post('/resubmit-kra-kpi', authMiddleware, async (req, res) => {
+  try {
+    const { rejection_id } = req.body;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!rejection_id) {
+      return res.status(400).json({ error: 'rejection_id is required' });
+    }
+
+    // Get current user's employee ID
+    const currentUserEmpResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (currentUserEmpResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Current user employee record not found' });
+    }
+
+    const employeeId = currentUserEmpResult.rows[0].id;
+
+    // Verify the rejection belongs to this employee
+    const rejectionCheck = await query(
+      'SELECT employee_id FROM kra_kpi_rejections WHERE id = $1',
+      [rejection_id]
+    );
+
+    if (rejectionCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Rejection not found' });
+    }
+
+    if (rejectionCheck.rows[0].employee_id !== employeeId) {
+      return res.status(403).json({ error: 'Not authorized to resubmit this rejection' });
+    }
+
+    // Mark as resubmitted
+    const result = await query(
+      `UPDATE kra_kpi_rejections 
+       SET resubmitted_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND resubmitted_at IS NULL
+       RETURNING *`,
+      [rejection_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'Rejection not found or already resubmitted' });
+    }
+
     res.json({ data: result.rows[0] });
   } catch (error) {
+    console.error('Error resubmitting KRA/KPI:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -640,7 +1637,7 @@ router.post('/competency-self-ratings', authMiddleware, async (req, res) => {
 router.get('/hr-pending-reviews', authMiddleware, async (req, res) => {
   try {
     const { cycle_id } = req.query;
-    
+
     let sql = `
       SELECT 
         qmr.*,
@@ -648,11 +1645,32 @@ router.get('/hr-pending-reviews', authMiddleware, async (req, res) => {
         e.emp_code as employee_code,
         m.full_name as manager_name,
         m.emp_code as manager_code,
-        pc.name as cycle_name
+        pc.name as cycle_name,
+        -- For post-transition reviews, calculate average with pre-transition (if HR approved)
+        CASE 
+          WHEN qmr.period_type = 'post_transition'::period_type AND qmr.transition_id IS NOT NULL THEN
+            COALESCE(
+              (
+                SELECT (pre.calculated_overall_rating + qmr.calculated_overall_rating) / 2.0
+                FROM quarterly_manager_reviews pre
+                WHERE pre.employee_id = qmr.employee_id
+                  AND pre.cycle_id = qmr.cycle_id
+                  AND pre.quarter = qmr.quarter
+                  AND pre.period_type = 'pre_transition'::period_type
+                  AND pre.transition_id = qmr.transition_id
+                  AND pre.status = 'submitted'
+                  AND pre.hr_approved_at IS NOT NULL
+                LIMIT 1
+              ),
+              qmr.calculated_overall_rating
+            )
+          ELSE
+            qmr.calculated_overall_rating
+        END as display_rating
       FROM quarterly_manager_reviews qmr
-      INNER JOIN employees e ON e.id = qmr.employee_id
-      INNER JOIN employees m ON m.id = qmr.reviewer_id
-      INNER JOIN performance_cycles pc ON pc.id = qmr.cycle_id
+      JOIN employees e ON e.id = qmr.employee_id
+      LEFT JOIN employees m ON m.emp_code = e.manager_code
+      LEFT JOIN performance_cycles pc ON pc.id = qmr.cycle_id
       WHERE qmr.status = 'submitted' 
         AND qmr.hr_approved_at IS NULL
     `;
@@ -665,17 +1683,1246 @@ router.get('/hr-pending-reviews', authMiddleware, async (req, res) => {
     }
 
     sql += ' ORDER BY qmr.created_at DESC';
-    
     const result = await query(sql, params);
     res.json({ data: result.rows });
   } catch (error) {
-    console.error('Get HR pending reviews error:', error);
+    console.error('Error fetching HR pending reviews:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/hr-pending-year-end-reviews', authMiddleware, async (req, res) => {
+  try {
+    const { cycle_id } = req.query;
+
+    let sql = `
+      SELECT 
+        me.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.department,
+        m.full_name as manager_name,
+        m.emp_code as manager_code,
+        pc.name as cycle_name
+      FROM manager_evaluations me
+      INNER JOIN employees e ON e.id = me.employee_id
+      LEFT JOIN employees m ON m.id = me.evaluator_id
+      INNER JOIN performance_cycles pc ON pc.id = me.cycle_id
+      WHERE me.status = 'submitted' 
+        AND me.released_at IS NULL
+    `;
+    const params = [];
+    let idx = 1;
+
+    if (cycle_id) {
+      sql += ` AND me.cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+
+    sql += ' ORDER BY me.created_at DESC';
+
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get HR pending year-end reviews error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/hr/normalize
+// Normalize ratings for a quarter using Box-Cox transform
+router.post('/hr/normalize', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { quarter, cycle_id } = req.query;
+    const userId = req.user?.userId;
+
+    if (!quarter || !cycle_id) {
+      return res.status(400).json({ error: 'quarter and cycle_id are required' });
+    }
+
+    const quarterNum = parseInt(quarter);
+    if (quarterNum < 1 || quarterNum > 4) {
+      return res.status(400).json({ error: 'quarter must be between 1 and 4' });
+    }
+
+    // Extract optional configuration from request body
+    const config = {};
+    if (req.body.managerWeight !== undefined) {
+      config.managerWeight = parseFloat(req.body.managerWeight);
+      config.gradeWeight = 1 - config.managerWeight; // Ensure weights sum to 1
+    }
+    if (req.body.minGroupSize !== undefined) {
+      config.minGroupSize = parseInt(req.body.minGroupSize);
+    }
+    if (req.body.useWinsorization !== undefined) {
+      config.useWinsorization = req.body.useWinsorization === true || req.body.useWinsorization === 'true';
+    }
+    if (req.body.maxChangeFromRaw !== undefined) {
+      config.maxChangeFromRaw = parseFloat(req.body.maxChangeFromRaw);
+    }
+
+    console.log(`Starting normalization for quarter ${quarterNum}, cycle ${cycle_id}`, config);
+    try {
+      const result = await normalizeRatings(quarterNum, cycle_id, userId, config);
+      console.log(`Normalization completed:`, result);
+
+      // If no ratings were processed, provide more detailed error message
+      if (result.processed === 0) {
+        console.warn(`Normalization returned 0 processed ratings. Details:`, result);
+        res.status(200).json({
+          data: result,
+          warning: result.message || 'No ratings were processed. Check server logs for details.'
+        });
+      } else {
+        res.json({ data: result });
+      }
+    } catch (error) {
+      console.error('Normalization error:', error);
+      res.status(500).json({
+        error: error.message,
+        details: 'Check server console logs for more information about why normalization failed.'
+      });
+    }
+  } catch (error) {
+    console.error('Normalize ratings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+router.post('/hr/calibrate', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { quarter, cycle_id } = req.query;
+    const userId = req.user?.userId;
+
+    if (!quarter || !cycle_id) {
+      return res.status(400).json({ error: 'quarter and cycle_id are required' });
+    }
+
+    const quarterNum = parseInt(quarter);
+    if (quarterNum < 1 || quarterNum > 4) {
+      return res.status(400).json({ error: 'quarter must be between 1 and 4' });
+    }
+
+    console.log(`Starting calibration for quarter ${quarterNum}, cycle ${cycle_id}`);
+    try {
+      const result = await applyCalibration(quarterNum, cycle_id, userId);
+      res.json({ data: result });
+    } catch (error) {
+      console.error('Calibration error:', error);
+      res.status(500).json({
+        error: error.message,
+        details: 'Check server console logs for more information about why calibration failed.'
+      });
+    }
+  } catch (error) {
+    console.error('Calibrate ratings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/evaluations/hr/normalized-ratings
+// Get normalized ratings for HR review
+router.get('/hr/normalized-ratings', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { quarter, cycle_id, status } = req.query;
+
+    if (!quarter || !cycle_id) {
+      return res.status(400).json({ error: 'quarter and cycle_id are required' });
+    }
+
+    let sql = `
+      SELECT 
+        nr.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.grade,
+        m.full_name as manager_name,
+        m.emp_code as manager_code
+      FROM normalized_ratings nr
+      JOIN employees e ON e.id = nr.employee_id
+      LEFT JOIN employees m ON m.id = nr.manager_id
+      WHERE nr.performance_cycle_id = $1 AND nr.quarter = $2
+    `;
+    const params = [cycle_id, parseInt(quarter)];
+    let idx = 3;
+
+    if (status) {
+      sql += ` AND nr.status = $${idx++}`;
+      params.push(status);
+    }
+
+    sql += ' ORDER BY e.emp_code';
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Error fetching normalized ratings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/hr/send-to-manager
+// Send normalized and calibrated ratings to manager for review
+// Note: Calibration must be applied before sending to manager
+router.post('/hr/send-to-manager', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { employeeIds, quarter, cycleId } = req.body;
+
+    if (!employeeIds || !Array.isArray(employeeIds) || employeeIds.length === 0) {
+      return res.status(400).json({ error: 'employeeIds array is required' });
+    }
+    if (!quarter || !cycleId) {
+      return res.status(400).json({ error: 'quarter and cycleId are required' });
+    }
+
+    // Check if calibration is enabled - only require calibrated_rating if enabled
+    const calibrationEnabled = await isCalibrationEnabled();
+
+    // Verify that calibrated_rating exists for all employees before sending (only if calibration is enabled)
+    if (calibrationEnabled) {
+      // Use IN clause with proper array handling for Sequelize
+      const checkPlaceholders = employeeIds.map((_, i) => `?`).join(',');
+      const checkResult = await query(
+        `SELECT employee_id, calibrated_rating
+         FROM normalized_ratings
+         WHERE employee_id IN (${checkPlaceholders})
+           AND quarter = ?
+           AND performance_cycle_id = ?
+           AND status IN ('DRAFT', 'REJECTED')`,
+        [...employeeIds, parseInt(quarter), cycleId]
+      );
+
+      const missingCalibration = checkResult.rows.filter(r => r.calibrated_rating === null || r.calibrated_rating === undefined);
+      if (missingCalibration.length > 0) {
+        return res.status(400).json({
+          error: 'Calibration required before sending to manager',
+          details: `${missingCalibration.length} employees do not have calibrated_rating. Please run calibration first.`,
+          uncalibrated: missingCalibration.map(r => r.employee_id)
+        });
+      }
+    }
+
+    // Update status to SENT_TO_MANAGER
+    // Use IN clause with proper array handling for Sequelize
+    const updatePlaceholders = employeeIds.map((_, i) => `?`).join(',');
+    // Only require calibrated_rating in WHERE clause if calibration is enabled
+    const whereClause = calibrationEnabled
+      ? `AND status IN ('DRAFT', 'REJECTED') AND calibrated_rating IS NOT NULL`
+      : `AND status IN ('DRAFT', 'REJECTED')`;
+
+    const result = await query(
+      `UPDATE normalized_ratings 
+       SET status = 'SENT_TO_MANAGER', updated_at = NOW()
+       WHERE employee_id IN (${updatePlaceholders})
+         AND quarter = ?
+         AND performance_cycle_id = ?
+         ${whereClause}`,
+      [...employeeIds, parseInt(quarter), cycleId]
+    );
+
+    console.log(`[Send to Manager] Sent ${result.rowCount} ratings to managers (excluding pre-transition reviews)`);
+
+    res.json({ data: [], count: result.rowCount });
+  } catch (error) {
+    console.error('Error sending to manager:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/manager/review
+// Manager accepts or rejects normalized ratings
+// For transition employees: Must filter by period_type and transition_id
+// If old and new managers are different, only new manager can approve
+router.post('/manager/review', authMiddleware, async (req, res) => {
+  try {
+    const { employeeId, quarter, cycleId, action, periodType, transitionId } = req.body;
+    const currentUserProfileId = req.user?.userId;
+
+    if (!employeeId || !quarter || !cycleId || !action) {
+      return res.status(400).json({ error: 'employeeId, quarter, cycleId, and action are required' });
+    }
+    if (!['ACCEPT', 'REJECT'].includes(action)) {
+      return res.status(400).json({ error: 'action must be ACCEPT or REJECT' });
+    }
+
+    // Get current user's employee ID from profile_id
+    const currentUserEmpResult = await query(
+      `SELECT id FROM employees WHERE profile_id = $1`,
+      [currentUserProfileId]
+    );
+
+    if (currentUserEmpResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Current user employee record not found' });
+    }
+
+    const currentUserEmployeeId = currentUserEmpResult.rows[0].id;
+
+    // Check if employee has transition and verify manager authorization
+    const transitionCheck = await query(
+      `SELECT new_manager_id, old_manager_id
+       FROM employee_quarter_transitions
+       WHERE employee_id = $1
+         AND cycle_id = $2
+         AND quarter = $3`,
+      [employeeId, cycleId, parseInt(quarter)]
+    );
+
+    if (transitionCheck.rows.length > 0) {
+      const transition = transitionCheck.rows[0];
+      // Determine which manager can approve:
+      // - If new_manager_id exists and is different from old_manager_id, only new manager can approve
+      // - If new_manager_id is null, old manager can approve
+      // - If new_manager_id is same as old_manager_id, either can approve (handled by direct manager check below)
+      if (transition.new_manager_id &&
+        transition.old_manager_id &&
+        transition.new_manager_id !== transition.old_manager_id) {
+        // Different managers: only new manager can approve
+        if (currentUserEmployeeId !== transition.new_manager_id) {
+          return res.status(403).json({
+            error: 'Only the new manager can approve normalized ratings for transition employees',
+            hint: 'For transition employees with different old and new managers, only the new manager can approve'
+          });
+        }
+      } else if (!transition.new_manager_id && transition.old_manager_id) {
+        // new_manager_id is null: old manager can approve
+        if (currentUserEmployeeId !== transition.old_manager_id) {
+          return res.status(403).json({
+            error: 'Only the old manager can approve normalized ratings for transition employees',
+            hint: 'For transition employees where new_manager_id is null, the old manager can approve'
+          });
+        }
+      }
+    }
+
+    // Also check if user is the direct manager or new manager in transition
+    const employeeCheck = await query(
+      `SELECT e.manager_code, m.id as manager_id
+       FROM employees e
+       LEFT JOIN employees m ON m.emp_code = e.manager_code
+       WHERE e.id = $1`,
+      [employeeId]
+    );
+
+    if (employeeCheck.rows.length > 0) {
+      const employee = employeeCheck.rows[0];
+      const currentUserEmpCodeResult = await query(
+        `SELECT emp_code FROM employees WHERE id = $1`,
+        [currentUserEmployeeId]
+      );
+
+      if (currentUserEmpCodeResult.rows.length > 0) {
+        const userEmpCode = currentUserEmpCodeResult.rows[0].emp_code;
+        const isDirectManager = employee.manager_code === userEmpCode;
+        const isNewManager = transitionCheck.rows.length > 0 &&
+          transitionCheck.rows[0].new_manager_id === currentUserEmployeeId;
+        const isOldManager = transitionCheck.rows.length > 0 &&
+          !transitionCheck.rows[0].new_manager_id &&
+          transitionCheck.rows[0].old_manager_id === currentUserEmployeeId;
+
+        if (!isDirectManager && !isNewManager && !isOldManager) {
+          // Check for delegation
+          const delegationCheck = await query(
+            `SELECT 1 FROM delegations
+             WHERE delegate_id = $1
+               AND reportee_id = $2
+               AND cycle_id = $3
+               AND (quarter = $4 OR quarter IS NULL)
+               AND revoked_at IS NULL`,
+            [currentUserEmployeeId, employeeId, cycleId, parseInt(quarter)]
+          );
+
+          if (delegationCheck.rows.length === 0) {
+            return res.status(403).json({
+              error: 'Not authorized to review this employee\'s normalized rating',
+              hint: 'You must be the employee\'s manager, new manager (for transitions), or a delegate'
+            });
+          }
+        }
+      }
+    }
+
+    const newStatus = action === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED';
+
+    // Update normalized_ratings status
+    const result = await query(
+      `UPDATE normalized_ratings 
+       SET status = $1, updated_at = NOW()
+       WHERE employee_id = $2 
+         AND quarter = $3 
+         AND performance_cycle_id = $4
+         AND status = 'SENT_TO_MANAGER'`,
+      [newStatus, employeeId, parseInt(quarter), cycleId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        error: 'No rating found or already processed',
+        hint: 'Make sure the rating status is SENT_TO_MANAGER'
+      });
+    }
+    res.json({ data: { employeeId, status: newStatus } });
+  } catch (error) {
+    console.error('Error in manager review:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/hr/publish
+router.post('/hr/publish', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { employeeIds, quarter, cycleId } = req.body;
+
+    if (!employeeIds || !Array.isArray(employeeIds) || employeeIds.length === 0) {
+      return res.status(400).json({ error: 'employeeIds array is required' });
+    }
+    if (!quarter || !cycleId) {
+      return res.status(400).json({ error: 'quarter and cycleId are required' });
+    }
+
+    const calibrationEnabled = await isCalibrationEnabled();
+
+    if (calibrationEnabled) {
+      // Use IN clause with proper array handling for Sequelize
+      const checkPlaceholders = employeeIds.map((_, i) => `?`).join(',');
+      const checkQuery = await query(
+        `SELECT employee_id, calibrated_rating, status
+         FROM normalized_ratings
+         WHERE employee_id IN (${checkPlaceholders})
+           AND quarter = ?
+           AND performance_cycle_id = ?`,
+        [...employeeIds, parseInt(quarter), cycleId]
+      );
+
+      const missingCalibration = checkQuery.rows.filter(r =>
+        r.status === 'ACCEPTED' && (r.calibrated_rating === null || r.calibrated_rating === undefined)
+      );
+
+      if (missingCalibration.length > 0) {
+        return res.status(400).json({
+          error: 'Cannot publish without calibrated_rating',
+          details: `${missingCalibration.length} employees do not have calibrated_rating. Please run calibration first.`
+        });
+      }
+    }
+
+    // Get HR user ID (profile_id) from authenticated user
+    const hrUserId = req.user?.userId;
+    if (!hrUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    // Use IN clause with proper array handling for Sequelize
+    const publishPlaceholders = employeeIds.map((_, i) => `?`).join(',');
+
+    // Update normalized_ratings to PUBLISHED
+    // Only require calibrated_rating in WHERE clause if calibration is enabled
+    const whereClause = calibrationEnabled
+      ? `AND status = 'ACCEPTED' AND calibrated_rating IS NOT NULL`
+      : `AND status = 'ACCEPTED'`;
+
+    const result = await query(
+      `UPDATE normalized_ratings 
+       SET status = 'PUBLISHED', updated_at = NOW()
+       WHERE employee_id IN (${publishPlaceholders}) 
+         AND quarter = ? 
+         AND performance_cycle_id = ?
+         ${whereClause}`,
+      [...employeeIds, parseInt(quarter), cycleId]
+    );
+
+    // Also update quarterly_manager_reviews with HR approval and release timestamps
+    // This allows employees to accept/reject ratings
+    const qmrUpdatePlaceholders = employeeIds.map((_, i) => `?`).join(',');
+    await query(
+      `UPDATE quarterly_manager_reviews 
+       SET hr_approved_at = NOW(),
+           hr_approved_by = ?,
+           released_at = NOW(),
+           updated_at = NOW()
+       WHERE employee_id IN (${qmrUpdatePlaceholders})
+         AND quarter = ?
+         AND cycle_id = ?
+         AND hr_approved_at IS NULL`,
+      [hrUserId, ...employeeIds, parseInt(quarter), cycleId]
+    );
+
+    res.json({ data: [], count: result.rowCount });
+  } catch (error) {
+    console.error('Error publishing ratings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/evaluations/hr/normalized-rating/:id
+// Update normalized rating and/or calibrated rating (for rejected ratings)
+// HR can edit both final_normalized_rating and calibrated_rating independently
+router.put('/hr/normalized-rating/:id', authMiddleware, requireRole(['hr_admin', 'hrbp', 'system_admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { final_normalized_rating, calibrated_rating } = req.body;
+
+    // At least one field must be provided
+    if (final_normalized_rating === undefined && calibrated_rating === undefined) {
+      return res.status(400).json({ error: 'At least one of final_normalized_rating or calibrated_rating must be provided' });
+    }
+
+    // Check if record is PUBLISHED (immutable)
+    const checkQuery = await query(
+      `SELECT status FROM normalized_ratings WHERE id = $1`,
+      [id]
+    );
+
+    if (checkQuery.rows.length === 0) {
+      return res.status(404).json({ error: 'Rating not found' });
+    }
+
+    if (checkQuery.rows[0].status === 'PUBLISHED') {
+      return res.status(403).json({ error: 'Cannot update PUBLISHED ratings. They are immutable.' });
+    }
+
+    // Build dynamic UPDATE query based on what's provided
+    const updateFields = [];
+    const updateParams = [];
+    let paramIndex = 1;
+
+    if (final_normalized_rating !== undefined) {
+      updateFields.push(`final_normalized_rating = $${paramIndex++}`);
+      updateParams.push(parseFloat(final_normalized_rating));
+    }
+
+    if (calibrated_rating !== undefined) {
+      updateFields.push(`calibrated_rating = $${paramIndex++}`);
+      updateParams.push(calibrated_rating === null ? null : parseFloat(calibrated_rating));
+    }
+
+    // Always update status to DRAFT and updated_at
+    updateFields.push(`status = 'DRAFT'`);
+    updateFields.push(`updated_at = NOW()`);
+
+    // Add id as last parameter for WHERE clause
+    updateParams.push(id);
+
+    const updateQuery = `
+      UPDATE normalized_ratings 
+      SET ${updateFields.join(', ')}
+      WHERE id = $${paramIndex}
+        AND status IN ('REJECTED', 'DRAFT', 'SENT_TO_MANAGER')
+        AND status != 'PUBLISHED'
+      RETURNING id, final_normalized_rating, calibrated_rating
+    `;
+
+    const result = await query(updateQuery, updateParams);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Rating not found or cannot be updated' });
+    }
+
+    const updatedData = result.rows[0];
+    const messages = [];
+
+    if (final_normalized_rating !== undefined) {
+      messages.push('Normalized rating updated');
+    }
+    if (calibrated_rating !== undefined) {
+      messages.push('Calibrated rating updated');
+    }
+
+    res.json({
+      data: {
+        id: updatedData.id,
+        final_normalized_rating: updatedData.final_normalized_rating,
+        calibrated_rating: updatedData.calibrated_rating,
+        message: messages.join('. ') + '.'
+      }
+    });
+  } catch (error) {
+    console.error('Error updating normalized rating:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/evaluations/manager/normalized-ratings
+// Get normalized and calibrated ratings for a manager's team
+// Managers see: raw_rating, final_normalized_rating, calibrated_rating
+router.get('/manager/normalized-ratings', authMiddleware, async (req, res) => {
+  try {
+    const { manager_id, quarter, cycle_id } = req.query;
+
+    if (!manager_id || !quarter || !cycle_id) {
+      return res.status(400).json({ error: 'manager_id, quarter, and cycle_id are required' });
+    }
+
+    // Get manager's emp_code
+    const managerResult = await query(
+      `SELECT emp_code FROM employees WHERE id = $1`,
+      [manager_id]
+    );
+
+    if (managerResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Manager not found' });
+    }
+
+    const managerEmpCode = managerResult.rows[0].emp_code;
+
+    const result = await query(
+      `SELECT 
+        nr.id,
+        nr.employee_id,
+        nr.raw_rating,
+        nr.final_normalized_rating,
+        nr.calibrated_rating,
+        nr.status,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        e.grade
+      FROM normalized_ratings nr
+      JOIN employees e ON e.id = nr.employee_id
+      WHERE nr.performance_cycle_id = $1 
+        AND nr.quarter = $2
+        AND nr.status = 'SENT_TO_MANAGER'
+        AND (
+          e.manager_code = $3
+          OR EXISTS (
+            SELECT 1 FROM employee_quarter_transitions eqt
+            WHERE eqt.employee_id = e.id
+              AND eqt.cycle_id = nr.performance_cycle_id
+              AND eqt.quarter = nr.quarter
+              AND eqt.transition_date <= CURRENT_DATE
+              AND (
+                (eqt.new_manager_id = $4 AND eqt.new_manager_id IS NOT NULL AND eqt.new_manager_id != eqt.old_manager_id)
+                OR (eqt.new_manager_id IS NULL AND eqt.old_manager_id = $4)
+              )
+          )
+        )
+      ORDER BY e.emp_code`,
+      [cycle_id, parseInt(quarter), managerEmpCode, manager_id, manager_id]
+    );
+
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Error fetching manager normalized ratings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/evaluations/employee/normalized-rating
+
+router.get('/employee/normalized-rating', authMiddleware, async (req, res) => {
+  try {
+    const { employee_id, quarter, cycle_id, period_type, transition_id } = req.query;
+
+    if (!employee_id || !quarter || !cycle_id) {
+      return res.status(400).json({ error: 'employee_id, quarter, and cycle_id are required' });
+    }
+
+    const userEmployee = await query(
+      `SELECT id FROM employees WHERE id = $1`,
+      [employee_id]
+    );
+
+    if (userEmployee.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const currentEmployeeId = userEmployee.rows[0].id;
+
+    // Only allow employees to see their own ratings
+    if (currentEmployeeId !== employee_id) {
+      return res.status(403).json({ error: 'Access denied. You can only view your own ratings.' });
+    }
+
+    // Get published calibrated rating
+    const result = await query(
+      `SELECT 
+        calibrated_rating,
+        status
+      FROM normalized_ratings
+      WHERE employee_id = $1 
+        AND performance_cycle_id = $2 
+        AND quarter = $3
+        AND status = 'PUBLISHED'
+      LIMIT 1`,
+      [employee_id, cycle_id, parseInt(quarter)]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ data: null });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error fetching employee normalized rating:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/rating-rejections', authMiddleware, async (req, res) => {
+  try {
+    const { cycle_id, status } = req.query;
+
+    let sql = `
+      SELECT 
+        rr.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        pc.name as cycle_name,
+        qmr.calculated_overall_rating,
+        qmr.overall_comments as manager_comments
+      FROM rating_rejections rr
+      INNER JOIN employees e ON e.id = rr.employee_id
+      INNER JOIN performance_cycles pc ON pc.id = rr.cycle_id
+      INNER JOIN quarterly_manager_reviews qmr ON qmr.id = rr.manager_review_id
+      WHERE 1=1
+    `;
+    const params = [];
+    let idx = 1;
+
+    if (cycle_id) {
+      sql += ` AND rr.cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+    if (status) {
+      sql += ` AND rr.status = $${idx++}`;
+      params.push(status);
+    }
+
+    sql += ' ORDER BY rr.created_at DESC';
+
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get rating rejections error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/year-end-evaluation', authMiddleware, async (req, res) => {
+  try {
+    const { employee_id, cycle_id } = req.query;
+
+    if (!employee_id || !cycle_id) {
+      return res.status(400).json({ error: 'employee_id and cycle_id are required' });
+    }
+
+    // Get year-end evaluation from manager_evaluations
+    const result = await query(
+      `SELECT * FROM manager_evaluations 
+       WHERE employee_id = ? AND cycle_id = ?`,
+      [employee_id, cycle_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ data: null });
+    }
+
+    const yearEndData = result.rows[0];
+
+    // Fetch calibrated ratings from normalized_ratings for each quarter
+    // Use calibrated_rating if available (PUBLISHED), otherwise use q1-q4_rating from manager_evaluations
+    const calibratedRatingsQuery = await query(
+      `SELECT quarter, calibrated_rating 
+       FROM normalized_ratings 
+       WHERE employee_id = ? 
+         AND performance_cycle_id = ? 
+         AND quarter IN (1, 2, 3, 4)
+         AND status = 'PUBLISHED'
+         AND calibrated_rating IS NOT NULL
+       ORDER BY quarter`,
+      [employee_id, cycle_id]
+    );
+
+    // Override q1-q4_rating with calibrated_rating if available
+    const calibratedRatings = {};
+    calibratedRatingsQuery.rows.forEach(row => {
+      calibratedRatings[`q${row.quarter}_rating`] = row.calibrated_rating;
+    });
+
+    // Update yearEndData with calibrated ratings
+    if (calibratedRatings.q1_rating !== undefined) {
+      yearEndData.q1_rating = calibratedRatings.q1_rating;
+    }
+    if (calibratedRatings.q2_rating !== undefined) {
+      yearEndData.q2_rating = calibratedRatings.q2_rating;
+    }
+    if (calibratedRatings.q3_rating !== undefined) {
+      yearEndData.q3_rating = calibratedRatings.q3_rating;
+    }
+    if (calibratedRatings.q4_rating !== undefined) {
+      yearEndData.q4_rating = calibratedRatings.q4_rating;
+    }
+
+    // Recalculate overall rating if any quarterly ratings were updated
+    if (Object.keys(calibratedRatings).length > 0) {
+      const ratingsArray = [
+        yearEndData.q1_rating,
+        yearEndData.q2_rating,
+        yearEndData.q3_rating,
+        yearEndData.q4_rating
+      ].filter(r => r !== null && r !== undefined);
+
+      if (ratingsArray.length > 0) {
+        yearEndData.calculated_overall_rating = ratingsArray.reduce((a, b) => parseFloat(a) + parseFloat(b), 0) / ratingsArray.length;
+      }
+    }
+
+    res.json({ data: yearEndData });
+  } catch (error) {
+    console.error('Get year-end evaluation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/year-end-evaluation
+// Create or update year-end evaluation for an employee
+router.post('/year-end-evaluation', authMiddleware, async (req, res) => {
+  try {
+    const {
+      employee_id,
+      cycle_id,
+      evaluator_id,
+      overall_rating,
+      overall_comments,
+      potential_rating,
+      development_recommendations,
+      status
+    } = req.body;
+
+    if (!employee_id || !cycle_id || !evaluator_id) {
+      return res.status(400).json({ error: 'employee_id, cycle_id, and evaluator_id are required' });
+    }
+
+    // Check if record exists
+    const existing = await query(
+      `SELECT id FROM manager_evaluations WHERE employee_id = $1 AND cycle_id = $2`,
+      [employee_id, cycle_id]
+    );
+
+    let result;
+    if (existing.rows.length > 0) {
+      // Update existing record
+      const statusValue = status || 'pending';
+      result = await query(
+        `UPDATE manager_evaluations SET
+          evaluator_id = $1,
+          overall_rating = $2,
+          overall_comments = $3,
+          potential_rating = $4,
+          development_recommendations = $5,
+          status = $6,
+          submitted_at = CASE WHEN $7 = 'submitted' THEN NOW() ELSE submitted_at END,
+          updated_at = NOW()
+         WHERE employee_id = $8 AND cycle_id = $9
+         RETURNING *`,
+        [
+          evaluator_id,
+          overall_rating ?? null,
+          overall_comments ?? null,
+          potential_rating ?? null,
+          development_recommendations ?? null,
+          statusValue,
+          statusValue,  // $7 - for CASE WHEN check
+          employee_id,
+          cycle_id
+        ]
+      );
+    } else {
+      // Create new record
+      const statusValue = status || 'pending';
+      result = await query(
+        `INSERT INTO manager_evaluations (
+          id, employee_id, cycle_id, evaluator_id,
+          overall_rating, overall_comments, potential_rating, development_recommendations,
+          status, submitted_at, created_at, updated_at
+        )
+        VALUES (
+          gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8,
+          CASE WHEN $9 = 'submitted' THEN NOW() ELSE NULL END,
+          NOW(), NOW()
+        )
+        RETURNING *`,
+        [
+          employee_id,
+          cycle_id,
+          evaluator_id,
+          overall_rating ?? null,
+          overall_comments ?? null,
+          potential_rating ?? null,
+          development_recommendations ?? null,
+          statusValue,
+          statusValue  // $9 - for CASE WHEN check
+        ]
+      );
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Upsert year-end evaluation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/hr-reject-year-end-review', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id, rejection_reason } = req.body;
+
+    if (!manager_evaluation_id || !rejection_reason) {
+      return res.status(400).json({ error: 'manager_evaluation_id and rejection_reason are required' });
+    }
+
+    // Update status back to pending for manager to revise
+    // Store rejection reason in overall_comments or development_recommendations temporarily
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET status = 'pending',
+           released_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted'
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Evaluation not found or already processed' });
+    }
+
+    res.json({ data: result.rows[0], rejection_reason });
+  } catch (error) {
+    console.error('HR reject year-end review error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/employee-accept-year-end-rating
+// Employee accepts their year-end rating
+router.post('/employee-accept-year-end-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id } = req.body;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_evaluation_id) {
+      return res.status(400).json({ error: 'manager_evaluation_id is required' });
+    }
+
+    // Get employee_id from user
+    const empResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    // Mark acknowledged_at in manager_evaluations
+    const result = await query(
+      `UPDATE manager_evaluations 
+       SET acknowledged_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1 AND released_at IS NOT NULL
+       RETURNING *`,
+      [manager_evaluation_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Evaluation not found or not yet released by HR' });
+    }
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Employee accept year-end rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/employee-reject-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_review_id, rejection_reason, cycle_id, quarter } = req.body;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_review_id || !rejection_reason || !cycle_id || !quarter) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    // Get employee_id from user
+    const empResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Create rating rejection
+    const rejectionResult = await query(
+      `INSERT INTO rating_rejections 
+       (id, employee_id, cycle_id, quarter, manager_review_id, rejection_reason, status, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'pending', NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
+         rejection_reason = EXCLUDED.rejection_reason,
+         status = 'pending',
+         updated_at = NOW()
+       RETURNING *`,
+      [employeeId, cycle_id, quarter, manager_review_id, rejection_reason]
+    );
+
+    // Mark employee_rejected_at in quarterly_manager_reviews
+    await query(
+      `UPDATE quarterly_manager_reviews 
+       SET employee_rejected_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [manager_review_id]
+    );
+
+    res.json({ data: rejectionResult.rows[0] });
+  } catch (error) {
+    console.error('Employee reject rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/employee-accept-rating
+// Employee accepts their rating
+router.post('/employee-accept-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_review_id } = req.body;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_review_id) {
+      return res.status(400).json({ error: 'manager_review_id is required' });
+    }
+
+    // Get employee_id from user
+    const empResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    // Mark employee_acknowledged_at in quarterly_manager_reviews
+    const result = await query(
+      `UPDATE quarterly_manager_reviews 
+       SET employee_acknowledged_at = NOW(),
+           employee_rejected_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND hr_approved_at IS NOT NULL
+       RETURNING *`,
+      [manager_review_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Review not found or not yet approved by HR' });
+    }
+
+    // Update any pending rejection to resolved
+    await query(
+      `UPDATE rating_rejections 
+       SET status = 'resolved',
+           resolved_at = NOW(),
+           resolved_by = $1,
+           updated_at = NOW()
+       WHERE manager_review_id = $2 AND status = 'pending'`,
+      [userId, manager_review_id]
+    );
+
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Employee accept rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/employee-reject-year-end-rating
+// Employee rejects their year-end rating
+router.post('/employee-reject-year-end-rating', authMiddleware, async (req, res) => {
+  try {
+    const { manager_evaluation_id, rejection_reason, cycle_id } = req.body;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!manager_evaluation_id || !rejection_reason || !cycle_id) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    // Get employee_id from user
+    const empResult = await query(
+      'SELECT id FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Create rating rejection for year-end (quarter = NULL)
+    const rejectionResult = await query(
+      `INSERT INTO rating_rejections 
+       (id, employee_id, cycle_id, quarter, manager_review_id, rejection_reason, status, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'pending', NOW(), NOW())
+       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
+         rejection_reason = EXCLUDED.rejection_reason,
+         status = 'pending',
+         updated_at = NOW()
+       RETURNING *`,
+      [employeeId, cycle_id, manager_evaluation_id, rejection_reason]
+    );
+
+    // Store acknowledgment_comments with rejection reason
+    await query(
+      `UPDATE manager_evaluations 
+       SET acknowledgment_comments = $2,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [manager_evaluation_id, `Rejected: ${rejection_reason}`]
+    );
+
+    res.json({ data: rejectionResult.rows[0] });
+  } catch (error) {
+    console.error('Employee reject year-end rating error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/evaluations/rating-rejections
+// Get rating rejections (for HR/Admin/BU Head)
+router.get('/rating-rejections', authMiddleware, async (req, res) => {
+  try {
+    const { cycle_id, status } = req.query;
+
+    let sql = `
+      SELECT 
+        rr.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        pc.name as cycle_name,
+        qmr.calculated_overall_rating,
+        qmr.overall_comments as manager_comments
+      FROM rating_rejections rr
+      INNER JOIN employees e ON e.id = rr.employee_id
+      INNER JOIN performance_cycles pc ON pc.id = rr.cycle_id
+      INNER JOIN quarterly_manager_reviews qmr ON qmr.id = rr.manager_review_id
+      WHERE 1=1
+    `;
+    const params = [];
+    let idx = 1;
+
+    if (cycle_id) {
+      sql += ` AND rr.cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+    if (status) {
+      sql += ` AND rr.status = $${idx++}`;
+      params.push(status);
+    }
+
+    sql += ' ORDER BY rr.created_at DESC';
+
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get rating rejections error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/evaluations/manager-rating-rejections
+// Get rating rejections for manager's direct reportees
+router.get('/manager-rating-rejections', authMiddleware, async (req, res) => {
+  try {
+    const { cycle_id, status } = req.query;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    // Get current user's employee record to find their emp_code
+    const empResult = await query(
+      'SELECT id, emp_code FROM employees WHERE profile_id = $1',
+      [userId]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee record not found' });
+    }
+
+    const managerEmpCode = empResult.rows[0].emp_code;
+    const managerId = empResult.rows[0].id;
+
+    // Get rating rejections for employees where manager_code matches current user's emp_code
+    // Also include employees with active transitions where this manager is the new manager
+    let sql = `
+      SELECT 
+        rr.*,
+        e.full_name as employee_name,
+        e.emp_code as employee_code,
+        pc.name as cycle_name,
+        qmr.calculated_overall_rating,
+        qmr.overall_comments as manager_comments
+      FROM rating_rejections rr
+      INNER JOIN employees e ON e.id = rr.employee_id
+      INNER JOIN performance_cycles pc ON pc.id = rr.cycle_id
+      INNER JOIN quarterly_manager_reviews qmr ON qmr.id = rr.manager_review_id
+      WHERE (
+        e.manager_code = $1
+        OR EXISTS (
+          SELECT 1 FROM employee_quarter_transitions eqt
+          WHERE eqt.employee_id = e.id
+            AND eqt.new_manager_id = $2
+            AND eqt.transition_date <= CURRENT_DATE
+        )
+      )
+      AND rr.quarter IS NOT NULL
+    `;
+    const params = [managerEmpCode, managerId];
+    let idx = 3;
+
+    if (cycle_id) {
+      sql += ` AND rr.cycle_id = $${idx++}`;
+      params.push(cycle_id);
+    }
+    if (status) {
+      sql += ` AND rr.status = $${idx++}`;
+      params.push(status);
+    }
+
+    sql += ' ORDER BY rr.created_at DESC';
+
+    const result = await query(sql, params);
+    res.json({ data: result.rows });
+  } catch (error) {
+    console.error('Get manager rating rejections error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // POST /api/evaluations/hr-approve-review
 // HR approves a manager review and releases it to employee
+// Special handling: Pre-transition reviews are approved directly (no normalization)
+// Post-transition aggregated reviews go through normalization workflow
 router.post('/hr-approve-review', authMiddleware, async (req, res) => {
   try {
     const { manager_review_id } = req.body;
@@ -689,7 +2936,90 @@ router.post('/hr-approve-review', authMiddleware, async (req, res) => {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    // Update quarterly_manager_reviews with HR approval
+    // First, get the review to check if it's a pre-transition review
+    const reviewCheck = await query(
+      `SELECT period_type, transition_id, status 
+       FROM quarterly_manager_reviews 
+       WHERE id = $1`,
+      [manager_review_id]
+    );
+
+    if (reviewCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Review not found' });
+    }
+
+    const review = reviewCheck.rows[0];
+
+    // Pre-transition reviews: Approve directly (no normalization/calibration)
+    if (review.period_type === 'pre_transition' && review.transition_id) {
+      const result = await query(
+        `UPDATE quarterly_manager_reviews 
+         SET hr_approved_at = NOW(),
+             hr_approved_by = $1,
+             released_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $2 AND status = 'submitted' AND hr_approved_at IS NULL
+         RETURNING *`,
+        [userId, manager_review_id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Review not found or already approved' });
+      }
+
+      console.log(`[HR Approve] Pre-transition review ${manager_review_id} approved directly (no normalization)`);
+      return res.json({
+        data: result.rows[0],
+        message: 'Pre-transition review approved. No normalization required.',
+        requires_normalization: false
+      });
+    }
+
+    // Post-transition aggregated reviews: Should go through normalization first
+    // But if HR wants to approve directly, allow it (for edge cases)
+    if (review.period_type === 'post_transition' && review.transition_id) {
+      // Check if normalization has been done
+      // Use JOIN instead of subqueries to avoid parameter repetition issues
+      const normalizedCheck = await query(
+        `SELECT nr.id, nr.status, nr.final_normalized_rating 
+         FROM normalized_ratings nr
+         INNER JOIN quarterly_manager_reviews qmr ON 
+           nr.employee_id = qmr.employee_id 
+           AND nr.quarter = qmr.quarter 
+           AND nr.performance_cycle_id = qmr.cycle_id
+         WHERE qmr.id = $1
+           AND nr.status IN ('DRAFT', 'SENT_TO_MANAGER', 'ACCEPTED', 'PUBLISHED')`,
+        [manager_review_id]
+      );
+
+      if (normalizedCheck.rows.length === 0) {
+        // No normalization yet - approve directly but warn HR
+        const result = await query(
+          `UPDATE quarterly_manager_reviews 
+           SET hr_approved_at = NOW(),
+               hr_approved_by = $1,
+               released_at = NOW(),
+               updated_at = NOW()
+           WHERE id = $2 AND status = 'submitted' AND hr_approved_at IS NULL
+           RETURNING *`,
+          [userId, manager_review_id]
+        );
+
+        if (result.rows.length === 0) {
+          return res.status(404).json({ error: 'Review not found or already approved' });
+        }
+
+        console.log(`[HR Approve] Post-transition review ${manager_review_id} approved without normalization (edge case)`);
+        return res.json({
+          data: result.rows[0],
+          message: 'Post-transition review approved. Consider normalizing before final approval.',
+          requires_normalization: true,
+          warning: 'Normalization recommended for post-transition reviews'
+        });
+      }
+    }
+
+    // Standard approval for non-transition or full-quarter reviews
     const result = await query(
       `UPDATE quarterly_manager_reviews 
        SET hr_approved_at = NOW(),
@@ -753,233 +3083,6 @@ router.post('/hr-reject-review', authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/evaluations/employee-reject-rating
-// Employee rejects their rating
-router.post('/employee-reject-rating', authMiddleware, async (req, res) => {
-  try {
-    const { manager_review_id, rejection_reason, cycle_id, quarter } = req.body;
-    const userId = req.user?.userId;
-    
-    if (!userId) {
-      return res.status(401).json({ error: 'User not authenticated' });
-    }
-
-    if (!manager_review_id || !rejection_reason || !cycle_id || !quarter) {
-      return res.status(400).json({ error: 'All fields are required' });
-    }
-
-    // Get employee_id from user
-    const empResult = await query(
-      'SELECT id FROM employees WHERE profile_id = $1',
-      [userId]
-    );
-
-    if (empResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Employee record not found' });
-    }
-
-    const employeeId = empResult.rows[0].id;
-
-    // Create rating rejection
-    const rejectionResult = await query(
-      `INSERT INTO rating_rejections 
-       (id, employee_id, cycle_id, quarter, manager_review_id, rejection_reason, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'pending', NOW(), NOW())
-       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
-         rejection_reason = EXCLUDED.rejection_reason,
-         status = 'pending',
-         updated_at = NOW()
-       RETURNING *`,
-      [employeeId, cycle_id, quarter, manager_review_id, rejection_reason]
-    );
-
-    // Mark employee_rejected_at in quarterly_manager_reviews
-    await query(
-      `UPDATE quarterly_manager_reviews 
-       SET employee_rejected_at = NOW(),
-           updated_at = NOW()
-       WHERE id = $1`,
-      [manager_review_id]
-    );
-
-    res.json({ data: rejectionResult.rows[0] });
-  } catch (error) {
-    console.error('Employee reject rating error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// POST /api/evaluations/employee-accept-rating
-// Employee accepts their rating
-router.post('/employee-accept-rating', authMiddleware, async (req, res) => {
-  try {
-    const { manager_review_id } = req.body;
-    const userId = req.user?.userId;
-    
-    if (!userId) {
-      return res.status(401).json({ error: 'User not authenticated' });
-    }
-
-    if (!manager_review_id) {
-      return res.status(400).json({ error: 'manager_review_id is required' });
-    }
-
-    // Get employee_id from user
-    const empResult = await query(
-      'SELECT id FROM employees WHERE profile_id = $1',
-      [userId]
-    );
-
-    if (empResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Employee record not found' });
-    }
-
-    // Mark employee_acknowledged_at in quarterly_manager_reviews
-    const result = await query(
-      `UPDATE quarterly_manager_reviews 
-       SET employee_acknowledged_at = NOW(),
-           employee_rejected_at = NULL,
-           updated_at = NOW()
-       WHERE id = $1 AND hr_approved_at IS NOT NULL
-       RETURNING *`,
-      [manager_review_id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Review not found or not yet approved by HR' });
-    }
-
-    // Update any pending rejection to resolved
-    await query(
-      `UPDATE rating_rejections 
-       SET status = 'resolved',
-           resolved_at = NOW(),
-           resolved_by = $1,
-           updated_at = NOW()
-       WHERE manager_review_id = $2 AND status = 'pending'`,
-      [userId, manager_review_id]
-    );
-
-    res.json({ data: result.rows[0] });
-  } catch (error) {
-    console.error('Employee accept rating error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ========== YEAR-END EVALUATION ==========
-
-// GET /api/evaluations/year-end-evaluation
-// Get year-end evaluation for an employee in a cycle
-router.get('/year-end-evaluation', authMiddleware, async (req, res) => {
-  try {
-    const { employee_id, cycle_id } = req.query;
-    
-    if (!employee_id || !cycle_id) {
-      return res.status(400).json({ error: 'employee_id and cycle_id are required' });
-    }
-    
-    const result = await query(
-      `SELECT * FROM manager_evaluations 
-       WHERE employee_id = $1 AND cycle_id = $2`,
-      [employee_id, cycle_id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.json({ data: null });
-    }
-    
-    res.json({ data: result.rows[0] });
-  } catch (error) {
-    console.error('Get year-end evaluation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// POST /api/evaluations/year-end-evaluation
-// Create or update year-end evaluation for an employee
-router.post('/year-end-evaluation', authMiddleware, async (req, res) => {
-  try {
-    const { 
-      employee_id, 
-      cycle_id, 
-      evaluator_id,
-      overall_rating,
-      overall_comments,
-      potential_rating,
-      development_recommendations,
-      status 
-    } = req.body;
-    
-    if (!employee_id || !cycle_id || !evaluator_id) {
-      return res.status(400).json({ error: 'employee_id, cycle_id, and evaluator_id are required' });
-    }
-    
-    // Check if record exists
-    const existing = await query(
-      `SELECT id FROM manager_evaluations WHERE employee_id = $1 AND cycle_id = $2`,
-      [employee_id, cycle_id]
-    );
-    
-    let result;
-    if (existing.rows.length > 0) {
-      // Update existing record
-      result = await query(
-        `UPDATE manager_evaluations SET
-          evaluator_id = $1,
-          overall_rating = $2,
-          overall_comments = $3,
-          potential_rating = $4,
-          development_recommendations = $5,
-          status = $6,
-          submitted_at = CASE WHEN $6 = 'submitted' THEN NOW() ELSE submitted_at END,
-          updated_at = NOW()
-         WHERE employee_id = $7 AND cycle_id = $8
-         RETURNING *`,
-        [
-          evaluator_id,
-          overall_rating ?? null,
-          overall_comments ?? null,
-          potential_rating ?? null,
-          development_recommendations ?? null,
-          status || 'pending',
-          employee_id,
-          cycle_id
-        ]
-      );
-    } else {
-      // Create new record
-      result = await query(
-        `INSERT INTO manager_evaluations (
-          id, employee_id, cycle_id, evaluator_id,
-          overall_rating, overall_comments, potential_rating, development_recommendations,
-          status, submitted_at, created_at, updated_at
-        )
-        VALUES (
-          gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8,
-          CASE WHEN $8 = 'submitted' THEN NOW() ELSE NULL END,
-          NOW(), NOW()
-        )
-        RETURNING *`,
-        [
-          employee_id,
-          cycle_id,
-          evaluator_id,
-          overall_rating ?? null,
-          overall_comments ?? null,
-          potential_rating ?? null,
-          development_recommendations ?? null,
-          status || 'pending'
-        ]
-      );
-    }
-    
-    res.json({ data: result.rows[0] });
-  } catch (error) {
-    console.error('Upsert year-end evaluation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // ========== YEAR-END HR REVIEW WORKFLOW ==========
 
@@ -988,7 +3091,7 @@ router.post('/year-end-evaluation', authMiddleware, async (req, res) => {
 router.get('/hr-pending-year-end-reviews', authMiddleware, async (req, res) => {
   try {
     const { cycle_id } = req.query;
-    
+
     let sql = `
       SELECT 
         me.*,
@@ -1014,7 +3117,7 @@ router.get('/hr-pending-year-end-reviews', authMiddleware, async (req, res) => {
     }
 
     sql += ' ORDER BY me.created_at DESC';
-    
+
     const result = await query(sql, params);
     res.json({ data: result.rows });
   } catch (error) {
@@ -1025,6 +3128,7 @@ router.get('/hr-pending-year-end-reviews', authMiddleware, async (req, res) => {
 
 // POST /api/evaluations/hr-approve-year-end-review
 // HR approves a year-end manager evaluation and releases it to employee
+// When approved, quarterly ratings (q1-q4) are set to calibrated_rating from normalized_ratings
 router.post('/hr-approve-year-end-review', authMiddleware, async (req, res) => {
   try {
     const { manager_evaluation_id } = req.body;
@@ -1033,201 +3137,1001 @@ router.post('/hr-approve-year-end-review', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'manager_evaluation_id is required' });
     }
 
-    // Update manager_evaluations - set released_at to mark HR approval
-    const result = await query(
-      `UPDATE manager_evaluations 
-       SET released_at = NOW(),
-           updated_at = NOW()
-       WHERE id = $1 AND status = 'submitted' AND released_at IS NULL
-       RETURNING *`,
+    // First, get the employee_id and cycle_id from manager_evaluations
+    const evalResult = await query(
+      `SELECT employee_id, cycle_id FROM manager_evaluations 
+       WHERE id = ? AND status = 'submitted' AND released_at IS NULL`,
       [manager_evaluation_id]
     );
 
-    if (result.rows.length === 0) {
+    if (evalResult.rows.length === 0) {
       return res.status(404).json({ error: 'Evaluation not found or already approved' });
     }
 
-    res.json({ data: result.rows[0] });
+    const { employee_id, cycle_id } = evalResult.rows[0];
+
+    // Fetch calibrated_rating from normalized_ratings for each quarter (1-4)
+    const calibratedRatingsQuery = await query(
+      `SELECT quarter, calibrated_rating 
+       FROM normalized_ratings 
+       WHERE employee_id = ? 
+         AND performance_cycle_id = ? 
+         AND quarter IN (1, 2, 3, 4)
+         AND status = 'PUBLISHED'
+         AND calibrated_rating IS NOT NULL
+       ORDER BY quarter`,
+      [employee_id, cycle_id]
+    );
+
+    // Build update query with calibrated ratings
+    const calibratedRatings = {};
+    calibratedRatingsQuery.rows.forEach(row => {
+      calibratedRatings[`q${row.quarter}_rating`] = row.calibrated_rating;
+    });
+
+    // Get current quarterly ratings before update
+    const currentRatingsResult = await query(
+      `SELECT q1_rating, q2_rating, q3_rating, q4_rating 
+       FROM manager_evaluations 
+       WHERE id = ?`,
+      [manager_evaluation_id]
+    );
+
+    // Merge current ratings with calibrated ratings (calibrated takes precedence)
+    const finalQuarterlyRatings = {
+      q1: currentRatingsResult.rows[0]?.q1_rating ?? null,
+      q2: currentRatingsResult.rows[0]?.q2_rating ?? null,
+      q3: currentRatingsResult.rows[0]?.q3_rating ?? null,
+      q4: currentRatingsResult.rows[0]?.q4_rating ?? null,
+    };
+
+    // Override with calibrated ratings where available
+    Object.keys(calibratedRatings).forEach(key => {
+      const quarterNum = parseInt(key.replace('q', '').replace('_rating', ''));
+      finalQuarterlyRatings[`q${quarterNum}`] = calibratedRatings[key];
+    });
+
+    // Prepare SET clause for quarters that have calibrated ratings
+    const setClauses = ['released_at = NOW()', 'updated_at = NOW()'];
+    const updateParams = [];
+
+    // Add quarter rating updates if calibrated ratings exist
+    for (let q = 1; q <= 4; q++) {
+      const quarterKey = `q${q}_rating`;
+      if (calibratedRatings[quarterKey] !== undefined) {
+        setClauses.push(`${quarterKey} = ?`);
+        updateParams.push(calibratedRatings[quarterKey]);
+      }
+    }
+
+    // Calculate average of all non-null quarterly ratings (after applying calibrated ratings)
+    const ratingsArray = [
+      finalQuarterlyRatings.q1,
+      finalQuarterlyRatings.q2,
+      finalQuarterlyRatings.q3,
+      finalQuarterlyRatings.q4
+    ].filter(r => r !== null && r !== undefined);
+
+    if (ratingsArray.length > 0) {
+      const avgRating = ratingsArray.reduce((a, b) => parseFloat(a) + parseFloat(b), 0) / ratingsArray.length;
+      setClauses.push('calculated_overall_rating = ?');
+      updateParams.push(parseFloat(avgRating.toFixed(2)));
+    }
+
+    // Add manager_evaluation_id as the last parameter
+    updateParams.push(manager_evaluation_id);
+
+    // Update manager_evaluations with calibrated ratings and release
+    const updateQuery = `
+      UPDATE manager_evaluations 
+      SET ${setClauses.join(', ')}
+      WHERE id = ?
+      RETURNING *
+    `;
+
+    const result = await query(updateQuery, updateParams);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Failed to update evaluation' });
+    }
+
+    // Log which quarters were updated
+    const updatedQuarters = Object.keys(calibratedRatings).map(k => k.replace('_rating', '').toUpperCase());
+    console.log(`Year-end approval: Updated quarterly ratings for employee ${employee_id} - Quarters: ${updatedQuarters.join(', ')}`);
+
+    res.json({
+      data: result.rows[0],
+      message: `Year-end evaluation approved. Quarterly ratings updated from calibrated ratings: ${updatedQuarters.join(', ')}`
+    });
   } catch (error) {
     console.error('HR approve year-end review error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// POST /api/evaluations/hr-reject-year-end-review
-// HR rejects a year-end manager evaluation (sends back to manager)
-router.post('/hr-reject-year-end-review', authMiddleware, async (req, res) => {
+// ========== PERIOD RATINGS ==========
+
+// GET /api/evaluations/period-ratings - Get period ratings for an employee
+router.get('/period-ratings', authMiddleware, async (req, res) => {
   try {
-    const { manager_evaluation_id, rejection_reason } = req.body;
+    const { employee_id, cycle_id, quarter, period_type } = req.query;
 
-    if (!manager_evaluation_id || !rejection_reason) {
-      return res.status(400).json({ error: 'manager_evaluation_id and rejection_reason are required' });
+    if (!employee_id || !cycle_id) {
+      return res.status(400).json({ error: 'employee_id and cycle_id are required' });
     }
 
-    // Update status back to pending for manager to revise
-    // Store rejection reason in overall_comments or development_recommendations temporarily
-    const result = await query(
-      `UPDATE manager_evaluations 
-       SET status = 'pending',
-           released_at = NULL,
-           updated_at = NOW()
-       WHERE id = $1 AND status = 'submitted'
-       RETURNING *`,
-      [manager_evaluation_id]
-    );
+    let sql = `
+      SELECT 
+        id,
+        employee_id,
+        cycle_id,
+        quarter,
+        transition_id,
+        period_type,
+        period_start_date,
+        period_end_date,
+        period_days,
+        weighted_avg_rating,
+        manager_id,
+        is_final,
+        created_at,
+        updated_at
+      FROM quarterly_period_ratings
+      WHERE employee_id = $1 AND cycle_id = $2
+    `;
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Evaluation not found or already processed' });
+    const params = [employee_id, cycle_id];
+    let paramIndex = 3;
+
+    if (quarter) {
+      sql += ` AND quarter = $${paramIndex++}`;
+      params.push(parseInt(quarter));
     }
 
-    res.json({ data: result.rows[0], rejection_reason });
+    if (period_type) {
+      sql += ` AND period_type = $${paramIndex++}::period_type`;
+      params.push(period_type);
+    }
+
+    sql += ` ORDER BY quarter, period_type`;
+
+    const result = await query(sql, params);
+
+    res.json({ data: result.rows });
   } catch (error) {
-    console.error('HR reject year-end review error:', error);
+    console.error('Get period ratings error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// POST /api/evaluations/employee-accept-year-end-rating
-// Employee accepts their year-end rating
-router.post('/employee-accept-year-end-rating', authMiddleware, async (req, res) => {
-  try {
-    const { manager_evaluation_id } = req.body;
-    const userId = req.user?.userId;
-    
-    if (!userId) {
-      return res.status(401).json({ error: 'User not authenticated' });
-    }
+// ========== KPI EVIDENCE FILE UPLOAD ==========
 
-    if (!manager_evaluation_id) {
-      return res.status(400).json({ error: 'manager_evaluation_id is required' });
-    }
+// Configure multer to store files in memory (we'll upload to SharePoint)
+const storage = multer.memoryStorage();
 
-    // Get employee_id from user
-    const empResult = await query(
-      'SELECT id FROM employees WHERE profile_id = $1',
-      [userId]
-    );
+// File filter - only allow PDFs
+const fileFilter = (req, file, cb) => {
+  if (file.mimetype === 'application/pdf') {
+    cb(null, true);
+  } else {
+    cb(new Error('Only PDF files are allowed'), false);
+  }
+};
 
-    if (empResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Employee record not found' });
-    }
-
-    // Mark acknowledged_at in manager_evaluations
-    const result = await query(
-      `UPDATE manager_evaluations 
-       SET acknowledged_at = NOW(),
-           updated_at = NOW()
-       WHERE id = $1 AND released_at IS NOT NULL
-       RETURNING *`,
-      [manager_evaluation_id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Evaluation not found or not yet released by HR' });
-    }
-
-    res.json({ data: result.rows[0] });
-  } catch (error) {
-    console.error('Employee accept year-end rating error:', error);
-    res.status(500).json({ error: error.message });
+// Configure multer with 5MB limit - single file upload
+const upload = multer({
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB
   }
 });
 
-// POST /api/evaluations/employee-reject-year-end-rating
-// Employee rejects their year-end rating
-router.post('/employee-reject-year-end-rating', authMiddleware, async (req, res) => {
+// POST /api/evaluations/kpi-evidence/upload - Upload evidence file (single file)
+router.post('/kpi-evidence/upload', authMiddleware, upload.single('file'), async (req, res) => {
   try {
-    const { manager_evaluation_id, rejection_reason, cycle_id } = req.body;
-    const userId = req.user?.userId;
-    
-    if (!userId) {
-      return res.status(401).json({ error: 'User not authenticated' });
+    const { goal_id, emp_code, quarter, year } = req.body;
+
+    if (!goal_id || !emp_code || !quarter || !year) {
+      return res.status(400).json({
+        error: 'Missing required parameters: goal_id, emp_code, quarter, year'
+      });
     }
 
-    if (!manager_evaluation_id || !rejection_reason || !cycle_id) {
-      return res.status(400).json({ error: 'All fields are required' });
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    // Get employee_id from user
+    // Get employee ID from emp_code
     const empResult = await query(
-      'SELECT id FROM employees WHERE profile_id = $1',
-      [userId]
+      'SELECT id FROM employees WHERE emp_code = $1',
+      [emp_code]
     );
 
     if (empResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Employee record not found' });
+      return res.status(404).json({ error: 'Employee not found' });
     }
 
     const employeeId = empResult.rows[0].id;
 
-    // Create rating rejection for year-end (quarter = NULL)
-    const rejectionResult = await query(
-      `INSERT INTO rating_rejections 
-       (id, employee_id, cycle_id, quarter, manager_review_id, rejection_reason, status, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'pending', NOW(), NOW())
-       ON CONFLICT (employee_id, cycle_id, quarter) DO UPDATE SET
-         rejection_reason = EXCLUDED.rejection_reason,
-         status = 'pending',
-         updated_at = NOW()
-       RETURNING *`,
-      [employeeId, cycle_id, manager_evaluation_id, rejection_reason]
+    // Get active cycle
+    const cycleResult = await query(
+      'SELECT id, year FROM performance_cycles WHERE status = $1 ORDER BY created_at DESC LIMIT 1',
+      ['active']
     );
 
-    // Store acknowledgment_comments with rejection reason
-    await query(
-      `UPDATE manager_evaluations 
-       SET acknowledgment_comments = $2,
-           updated_at = NOW()
-       WHERE id = $1`,
-      [manager_evaluation_id, `Rejected: ${rejection_reason}`]
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No active performance cycle found' });
+    }
+
+    const cycleId = cycleResult.rows[0].id;
+
+    // Get the quarter to verify it exists
+    const quarterResult = await query(
+      `SELECT quarter_start_date 
+       FROM quarterly_cycles 
+       WHERE performance_cycle_id = $1 AND quarter = $2`,
+      [cycleId, parseInt(quarter)]
     );
 
-    res.json({ data: rejectionResult.rows[0] });
+    if (quarterResult.rows.length === 0) {
+      return res.status(404).json({ error: `Quarter ${quarter} not found in active performance cycle` });
+    }
+
+    // Validate year matches the performance cycle year
+    const cycleYear = cycleResult.rows[0].year;
+    if (parseInt(year) !== cycleYear) {
+      return res.status(400).json({ error: `Year ${year} does not match active performance cycle year ${cycleYear}` });
+    }
+
+    // Generate unique filename: timestamp-originalname.pdf
+    const timestamp = Date.now();
+    const originalName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const fileName = `${timestamp}-${originalName}`;
+
+    // Build SharePoint folder path: PerformanceDocuments/{emp_code}/Quarter-{quarter}-{year}
+    const folderPath = `PerformanceDocuments/${emp_code}/Quarter-${quarter}-${year}`;
+
+    // Upload file to SharePoint
+    const sharePointUrl = await uploadFileToSharePoint(
+      req.file.buffer,
+      fileName,
+      folderPath
+    );
+
+    const filePaths = [sharePointUrl];
+
+    // Check if employee has a transition for this quarter
+    // For transition employees, treat 'full_quarter' as 'pre_transition'
+    const transitionCheck = await query(
+      `SELECT id FROM employee_quarter_transitions 
+       WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3
+       LIMIT 1`,
+      [employeeId, cycleId, parseInt(quarter)]
+    );
+    
+    const hasTransition = transitionCheck.rows.length > 0;
+    const transitionId = hasTransition ? transitionCheck.rows[0].id : null;
+    
+    // For transition employees, use 'pre_transition' instead of 'full_quarter'
+    // This ensures we don't create duplicate reviews
+    const periodType = hasTransition ? 'pre_transition' : 'full_quarter';
+
+    // Get existing evidence (may be text or JSON array of file paths)
+    // For transition employees, check both 'pre_transition' and 'full_quarter' reviews
+    // (to handle existing data that might have 'full_quarter')
+    let ratingResult;
+    if (hasTransition) {
+      // Transition employee: check both pre_transition and full_quarter reviews
+      ratingResult = await query(
+        `SELECT id, evidence FROM goal_self_ratings 
+         WHERE goal_id = $1 
+         AND quarterly_review_id IN (
+           SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $2 AND cycle_id = $3 AND quarter = $4
+           AND (
+             (period_type = 'pre_transition'::period_type AND transition_id = $5)
+             OR (period_type = 'full_quarter'::period_type AND transition_id IS NULL)
+           )
+         )
+         LIMIT 1`,
+        [goal_id, employeeId, cycleId, parseInt(quarter), transitionId]
+      );
+    } else {
+      // Non-transition employee: check full_quarter reviews only
+      ratingResult = await query(
+        `SELECT id, evidence FROM goal_self_ratings 
+         WHERE goal_id = $1 
+         AND quarterly_review_id IN (
+           SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $2 AND cycle_id = $3 AND quarter = $4
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type)
+         )
+         LIMIT 1`,
+        [goal_id, employeeId, cycleId, parseInt(quarter)]
+      );
+    }
+
+    let existingFiles = [];
+    let ratingId = null;
+
+    if (ratingResult.rows.length > 0) {
+      ratingId = ratingResult.rows[0].id;
+      const existingEvidence = ratingResult.rows[0].evidence;
+
+      // Parse existing evidence - could be JSON array or text
+      if (existingEvidence) {
+        try {
+          const parsed = JSON.parse(existingEvidence);
+          if (Array.isArray(parsed)) {
+            existingFiles = parsed;
+          }
+        } catch (e) {
+          // Not JSON, treat as text (backward compatibility)
+          // Keep existing text evidence, but add files
+        }
+      }
+    }
+
+    // Merge new files with existing files
+    const allFiles = [...existingFiles, ...filePaths];
+
+    // Update evidence field with JSON array of file paths
+    const evidenceJson = JSON.stringify(allFiles);
+
+    if (ratingId) {
+      // Update existing rating
+      await query(
+        'UPDATE goal_self_ratings SET evidence = $1, updated_at = NOW() WHERE id = $2',
+        [evidenceJson, ratingId]
+      );
+    } else {
+      // Create new rating record (minimal - just for evidence)
+      // Note: This requires quarterly_review_id, which should be created elsewhere
+      // For transition employees, use 'pre_transition' to avoid duplicate reviews
+      let reviewResult;
+      if (hasTransition) {
+        // Transition employee: look for pre_transition review first, then full_quarter
+        reviewResult = await query(
+          `SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3
+           AND (
+             (period_type = 'pre_transition'::period_type AND transition_id = $4)
+             OR (period_type = 'full_quarter'::period_type AND transition_id IS NULL)
+           )
+           ORDER BY CASE WHEN period_type = 'pre_transition'::period_type THEN 1 ELSE 2 END
+           LIMIT 1`,
+          [employeeId, cycleId, parseInt(quarter), transitionId]
+        );
+      } else {
+        // Non-transition employee: look for full_quarter review
+        reviewResult = await query(
+          `SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type)
+           LIMIT 1`,
+          [employeeId, cycleId, parseInt(quarter)]
+        );
+      }
+
+      let quarterlyReviewId = null;
+      if (reviewResult.rows.length > 0) {
+        quarterlyReviewId = reviewResult.rows[0].id;
+      } else {
+        // Create quarterly review if it doesn't exist
+        // For transition employees, use 'pre_transition' instead of 'full_quarter'
+        // Use 'pending' status (default) - valid enum values: pending, in_progress, submitted, calibrated, released
+        const newReviewResult = await query(
+          `INSERT INTO quarterly_self_reviews 
+           (id, employee_id, cycle_id, quarter, status, period_type, transition_id, created_at, updated_at)
+           VALUES (gen_random_uuid(), $1, $2, $3, 'pending', $4::period_type, $5, NOW(), NOW())
+           RETURNING id`,
+          [employeeId, cycleId, parseInt(quarter), periodType, transitionId]
+        );
+        quarterlyReviewId = newReviewResult.rows[0].id;
+      }
+
+      // Insert new rating
+      await query(
+        `INSERT INTO goal_self_ratings 
+         (id, quarterly_review_id, goal_id, evidence, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
+         ON CONFLICT (quarterly_review_id, goal_id) DO UPDATE SET
+           evidence = EXCLUDED.evidence,
+           updated_at = NOW()`,
+        [quarterlyReviewId, goal_id, evidenceJson]
+      );
+    }
+
+    res.json({
+      success: true,
+      files: filePaths,
+      message: 'File uploaded successfully'
+    });
   } catch (error) {
-    console.error('Employee reject year-end rating error:', error);
+    console.error('File upload error:', error);
+    res.status(500).json({ error: error.message || 'Failed to upload file' });
+  }
+});
+
+// GET /api/evaluations/kpi-evidence/files/:goalId - Get evidence files for a goal
+router.get('/kpi-evidence/files/:goalId', authMiddleware, async (req, res) => {
+  try {
+    const { goalId } = req.params;
+    const { quarter, employee_id } = req.query;
+
+    if (!quarter || !employee_id) {
+      return res.status(400).json({ error: 'Missing required parameters: quarter, employee_id' });
+    }
+
+    // Get active cycle
+    const cycleResult = await query(
+      'SELECT id FROM performance_cycles WHERE status = $1 ORDER BY created_at DESC LIMIT 1',
+      ['active']
+    );
+
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No active performance cycle found' });
+    }
+
+    const cycleId = cycleResult.rows[0].id;
+
+    // Check if employee has a transition for this quarter
+    // For transition employees, treat 'full_quarter' as 'pre_transition'
+    const transitionCheck = await query(
+      `SELECT id FROM employee_quarter_transitions 
+       WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3
+       LIMIT 1`,
+      [employee_id, cycleId, parseInt(quarter)]
+    );
+    
+    const hasTransition = transitionCheck.rows.length > 0;
+    const transitionId = hasTransition ? transitionCheck.rows[0].id : null;
+
+    // For transition employees, check both 'pre_transition' and 'full_quarter' reviews
+    // (to handle existing data that might have 'full_quarter')
+    let ratingResult;
+    if (hasTransition) {
+      // Transition employee: check both pre_transition and full_quarter reviews
+      ratingResult = await query(
+        `SELECT evidence FROM goal_self_ratings 
+         WHERE goal_id = $1 
+         AND quarterly_review_id IN (
+           SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $2 AND cycle_id = $3 AND quarter = $4
+           AND (
+             (period_type = 'pre_transition'::period_type AND transition_id = $5)
+             OR (period_type = 'full_quarter'::period_type AND transition_id IS NULL)
+           )
+         )
+         LIMIT 1`,
+        [goalId, employee_id, cycleId, parseInt(quarter), transitionId]
+      );
+    } else {
+      // Non-transition employee: check full_quarter reviews only
+      ratingResult = await query(
+        `SELECT evidence FROM goal_self_ratings 
+         WHERE goal_id = $1 
+         AND quarterly_review_id IN (
+           SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $2 AND cycle_id = $3 AND quarter = $4
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type)
+         )
+         LIMIT 1`,
+        [goalId, employee_id, cycleId, parseInt(quarter)]
+      );
+    }
+
+
+    if (ratingResult.rows.length === 0 || !ratingResult.rows[0].evidence) {
+      console.log('[GetEvidenceFiles] No rating found or no evidence');
+      return res.json({ files: [] });
+    }
+
+    const evidence = ratingResult.rows[0].evidence;
+    let files = [];
+
+    // Parse evidence - could be JSON array or text
+    try {
+      const parsed = JSON.parse(evidence);
+      if (Array.isArray(parsed)) {
+        files = parsed;
+      } else {
+        console.log('[GetEvidenceFiles] Evidence is JSON but not an array:', parsed);
+      }
+    } catch (e) {
+      // Not JSON, return empty array (backward compatibility - text evidence not shown as files)
+      console.log('[GetEvidenceFiles] Evidence is not JSON (text evidence):', evidence);
+    }
+
+    res.json({ files });
+  } catch (error) {
+    console.error('Get evidence files error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/evaluations/rating-rejections
-// Get rating rejections (for HR/Admin/BU Head)
-router.get('/rating-rejections', authMiddleware, async (req, res) => {
+// DELETE /api/evaluations/kpi-evidence/file - Delete a specific evidence file
+router.delete('/kpi-evidence/file', authMiddleware, async (req, res) => {
   try {
-    const { cycle_id, status } = req.query;
-    
-    let sql = `
-      SELECT 
-        rr.*,
-        e.full_name as employee_name,
-        e.emp_code as employee_code,
-        pc.name as cycle_name,
-        qmr.calculated_overall_rating,
-        qmr.overall_comments as manager_comments
-      FROM rating_rejections rr
-      INNER JOIN employees e ON e.id = rr.employee_id
-      INNER JOIN performance_cycles pc ON pc.id = rr.cycle_id
-      INNER JOIN quarterly_manager_reviews qmr ON qmr.id = rr.manager_review_id
-      WHERE 1=1
-    `;
-    const params = [];
-    let idx = 1;
+    const { goal_id, file_path, emp_code, quarter, year } = req.body;
 
-    if (cycle_id) {
-      sql += ` AND rr.cycle_id = $${idx++}`;
-      params.push(cycle_id);
-    }
-    if (status) {
-      sql += ` AND rr.status = $${idx++}`;
-      params.push(status);
+    if (!goal_id || !file_path || !emp_code || !quarter || !year) {
+      return res.status(400).json({
+        error: 'Missing required parameters: goal_id, file_path, emp_code, quarter, year'
+      });
     }
 
-    sql += ' ORDER BY rr.created_at DESC';
+    // Get employee ID
+    const empResult = await query(
+      'SELECT id FROM employees WHERE emp_code = $1',
+      [emp_code]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Get active cycle
+    const cycleResult = await query(
+      'SELECT id FROM performance_cycles WHERE status = $1 ORDER BY created_at DESC LIMIT 1',
+      ['active']
+    );
+
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No active performance cycle found' });
+    }
+
+    const cycleId = cycleResult.rows[0].id;
+
+    // Check if employee has a transition for this quarter
+    // For transition employees, treat 'full_quarter' as 'pre_transition'
+    const transitionCheck = await query(
+      `SELECT id FROM employee_quarter_transitions 
+       WHERE employee_id = $1 AND cycle_id = $2 AND quarter = $3
+       LIMIT 1`,
+      [employeeId, cycleId, parseInt(quarter)]
+    );
     
-    const result = await query(sql, params);
-    res.json({ data: result.rows });
+    const hasTransition = transitionCheck.rows.length > 0;
+    const transitionId = hasTransition ? transitionCheck.rows[0].id : null;
+
+    // Get existing evidence
+    // For transition employees, check both 'pre_transition' and 'full_quarter' reviews
+    let ratingResult;
+    if (hasTransition) {
+      // Transition employee: check both pre_transition and full_quarter reviews
+      ratingResult = await query(
+        `SELECT id, evidence FROM goal_self_ratings 
+         WHERE goal_id = $1 
+         AND quarterly_review_id IN (
+           SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $2 AND cycle_id = $3 AND quarter = $4
+           AND (
+             (period_type = 'pre_transition'::period_type AND transition_id = $5)
+             OR (period_type = 'full_quarter'::period_type AND transition_id IS NULL)
+           )
+         )
+         LIMIT 1`,
+        [goal_id, employeeId, cycleId, parseInt(quarter), transitionId]
+      );
+    } else {
+      // Non-transition employee: check full_quarter reviews only
+      ratingResult = await query(
+        `SELECT id, evidence FROM goal_self_ratings 
+         WHERE goal_id = $1 
+         AND quarterly_review_id IN (
+           SELECT id FROM quarterly_self_reviews 
+           WHERE employee_id = $2 AND cycle_id = $3 AND quarter = $4
+           AND (period_type IS NULL OR period_type = 'full_quarter'::period_type)
+         )
+         LIMIT 1`,
+        [goal_id, employeeId, cycleId, parseInt(quarter)]
+      );
+    }
+
+    if (ratingResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Rating not found' });
+    }
+
+    const ratingId = ratingResult.rows[0].id;
+    const existingEvidence = ratingResult.rows[0].evidence;
+
+    let files = [];
+    if (existingEvidence) {
+      try {
+        const parsed = JSON.parse(existingEvidence);
+        if (Array.isArray(parsed)) {
+          files = parsed;
+        }
+      } catch (e) {
+        // Not JSON, can't delete from text evidence
+        return res.status(400).json({ error: 'Cannot delete file from text evidence' });
+      }
+    }
+
+    // Remove file from array
+    const updatedFiles = files.filter(f => f !== file_path);
+
+    // Delete file from SharePoint
+    try {
+      await deleteFileFromSharePoint(file_path);
+    } catch (error) {
+      console.error('Error deleting file from SharePoint:', error);
+      // Continue with database update even if file deletion fails
+    }
+
+    // Update evidence
+    const evidenceJson = updatedFiles.length > 0 ? JSON.stringify(updatedFiles) : null;
+    await query(
+      'UPDATE goal_self_ratings SET evidence = $1, updated_at = NOW() WHERE id = $2',
+      [evidenceJson, ratingId]
+    );
+
+    res.json({ success: true, message: 'File deleted successfully' });
   } catch (error) {
-    console.error('Get rating rejections error:', error);
+    console.error('Delete file error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== MANAGER EVIDENCE FILE UPLOAD ==========
+
+// POST /api/evaluations/manager-evidence/upload - Upload manager evidence file (single file)
+router.post('/manager-evidence/upload', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    const { manager_review_id, goal_id, emp_code, quarter, year } = req.body;
+
+    if (!manager_review_id || !goal_id || !emp_code || !quarter || !year) {
+      return res.status(400).json({
+        error: 'Missing required parameters: manager_review_id, goal_id, emp_code, quarter, year'
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    // Get employee ID from emp_code
+    const empResult = await query(
+      'SELECT id FROM employees WHERE emp_code = $1',
+      [emp_code]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Verify manager_review_id exists and belongs to the employee
+    const reviewResult = await query(
+      'SELECT id, employee_id FROM quarterly_manager_reviews WHERE id = $1',
+      [manager_review_id]
+    );
+
+    if (reviewResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Manager review not found' });
+    }
+
+    if (reviewResult.rows[0].employee_id !== employeeId) {
+      return res.status(403).json({ error: 'Manager review does not belong to this employee' });
+    }
+
+    // Get active cycle
+    const cycleResult = await query(
+      'SELECT id, year FROM performance_cycles WHERE status = $1 ORDER BY created_at DESC LIMIT 1',
+      ['active']
+    );
+
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No active performance cycle found' });
+    }
+
+    const cycleId = cycleResult.rows[0].id;
+
+    // Get the quarter to verify it exists
+    const quarterResult = await query(
+      `SELECT quarter_start_date 
+       FROM quarterly_cycles 
+       WHERE performance_cycle_id = $1 AND quarter = $2`,
+      [cycleId, parseInt(quarter)]
+    );
+
+    if (quarterResult.rows.length === 0) {
+      return res.status(404).json({ error: `Quarter ${quarter} not found in active performance cycle` });
+    }
+
+    // Validate year matches the performance cycle year
+    const cycleYear = cycleResult.rows[0].year;
+    if (parseInt(year) !== cycleYear) {
+      return res.status(400).json({ error: `Year ${year} does not match active performance cycle year ${cycleYear}` });
+    }
+
+    // Generate unique filename: timestamp-originalname.pdf
+    const timestamp = Date.now();
+    const originalName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const fileName = `${timestamp}-${originalName}`;
+
+    // Build SharePoint folder path: PerformanceDocuments/{emp_code}/Quarter-{quarter}-{year}
+    const folderPath = `PerformanceDocuments/${emp_code}/Quarter-${quarter}-${year}`;
+
+    // Upload file to SharePoint
+    const sharePointUrl = await uploadFileToSharePoint(
+      req.file.buffer,
+      fileName,
+      folderPath
+    );
+
+    const filePaths = [sharePointUrl];
+
+    // Get existing evidence from manager feedback
+    const feedbackResult = await query(
+      'SELECT id, evidence FROM quarterly_kpi_manager_feedback WHERE manager_review_id = $1 AND goal_id = $2',
+      [manager_review_id, goal_id]
+    );
+
+    let existingFiles = [];
+    let feedbackId = null;
+
+    if (feedbackResult.rows.length > 0) {
+      feedbackId = feedbackResult.rows[0].id;
+      const existingEvidence = feedbackResult.rows[0].evidence;
+
+      // Parse existing evidence - could be JSON array or text
+      if (existingEvidence) {
+        try {
+          const parsed = JSON.parse(existingEvidence);
+          if (Array.isArray(parsed)) {
+            existingFiles = parsed;
+          }
+        } catch (e) {
+          // Not JSON, treat as text (backward compatibility)
+        }
+      }
+    }
+
+    // Merge new files with existing files
+    const allFiles = [...existingFiles, ...filePaths];
+
+    // Update evidence field with JSON array of file paths
+    const evidenceJson = JSON.stringify(allFiles);
+
+    if (feedbackId) {
+      // Update existing feedback
+      await query(
+        'UPDATE quarterly_kpi_manager_feedback SET evidence = $1, updated_at = NOW() WHERE id = $2',
+        [evidenceJson, feedbackId]
+      );
+    } else {
+      // Create new feedback record (minimal - just for evidence)
+      await query(
+        `INSERT INTO quarterly_kpi_manager_feedback 
+         (id, manager_review_id, goal_id, evidence, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
+         ON CONFLICT (manager_review_id, goal_id) DO UPDATE SET
+           evidence = EXCLUDED.evidence,
+           updated_at = NOW()`,
+        [manager_review_id, goal_id, evidenceJson]
+      );
+    }
+
+    res.json({
+      success: true,
+      files: filePaths,
+      message: 'File uploaded successfully'
+    });
+  } catch (error) {
+    console.error('Manager evidence file upload error:', error);
+    res.status(500).json({ error: error.message || 'Failed to upload file' });
+  }
+});
+
+// GET /api/evaluations/manager-evidence/files/:goalId - Get manager evidence files for a goal
+router.get('/manager-evidence/files/:goalId', authMiddleware, async (req, res) => {
+  try {
+    const { goalId } = req.params;
+    const { manager_review_id } = req.query;
+
+    if (!manager_review_id) {
+      return res.status(400).json({ error: 'Missing required parameter: manager_review_id' });
+    }
+
+    const feedbackResult = await query(
+      `SELECT evidence FROM quarterly_kpi_manager_feedback 
+       WHERE goal_id = $1 AND manager_review_id = $2
+       LIMIT 1`,
+      [goalId, manager_review_id]
+    );
+
+    if (feedbackResult.rows.length === 0 || !feedbackResult.rows[0].evidence) {
+      return res.json({ files: [] });
+    }
+
+    const evidence = feedbackResult.rows[0].evidence;
+    let files = [];
+
+    // Parse evidence - could be JSON array or text
+    try {
+      const parsed = JSON.parse(evidence);
+      if (Array.isArray(parsed)) {
+        files = parsed;
+      }
+    } catch (e) {
+      // Not JSON, return empty array (backward compatibility - text evidence not shown as files)
+    }
+
+    res.json({ files });
+  } catch (error) {
+    console.error('Get manager evidence files error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/evaluations/manager-evidence/file - Delete a specific manager evidence file
+router.delete('/manager-evidence/file', authMiddleware, async (req, res) => {
+  try {
+    const { manager_review_id, goal_id, file_path } = req.body;
+
+    if (!manager_review_id || !goal_id || !file_path) {
+      return res.status(400).json({
+        error: 'Missing required parameters: manager_review_id, goal_id, file_path'
+      });
+    }
+
+    // Get existing evidence
+    const feedbackResult = await query(
+      `SELECT id, evidence FROM quarterly_kpi_manager_feedback 
+       WHERE manager_review_id = $1 AND goal_id = $2
+       LIMIT 1`,
+      [manager_review_id, goal_id]
+    );
+
+    if (feedbackResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Manager feedback not found' });
+    }
+
+    const feedbackId = feedbackResult.rows[0].id;
+    const existingEvidence = feedbackResult.rows[0].evidence;
+
+    let files = [];
+    if (existingEvidence) {
+      try {
+        const parsed = JSON.parse(existingEvidence);
+        if (Array.isArray(parsed)) {
+          files = parsed;
+        }
+      } catch (e) {
+        // Not JSON, can't delete from text evidence
+        return res.status(400).json({ error: 'Cannot delete file from text evidence' });
+      }
+    }
+
+    // Remove file from array
+    const updatedFiles = files.filter(f => f !== file_path);
+
+    // Delete file from SharePoint
+    try {
+      await deleteFileFromSharePoint(file_path);
+    } catch (error) {
+      console.error('Error deleting file from SharePoint:', error);
+      // Continue with database update even if file deletion fails
+    }
+
+    // Update evidence
+    const evidenceJson = updatedFiles.length > 0 ? JSON.stringify(updatedFiles) : null;
+    await query(
+      'UPDATE quarterly_kpi_manager_feedback SET evidence = $1, updated_at = NOW() WHERE id = $2',
+      [evidenceJson, feedbackId]
+    );
+
+    res.json({ success: true, message: 'File deleted successfully' });
+  } catch (error) {
+    console.error('Delete manager evidence file error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/evaluations/rejection-documents/upload - Upload rejection document
+router.post('/rejection-documents/upload', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    const { emp_code, quarter, year } = req.body;
+
+    if (!emp_code || !quarter || !year) {
+      return res.status(400).json({
+        error: 'Missing required parameters: emp_code, quarter, year'
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    // Validate file type (PDF or Excel)
+    const allowedTypes = ['application/pdf', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel'];
+    if (!allowedTypes.includes(req.file.mimetype)) {
+      return res.status(400).json({ error: 'Invalid file type. Only PDF and Excel files are allowed.' });
+    }
+
+    // Validate file size (5MB max)
+    const maxSize = 5 * 1024 * 1024;
+    if (req.file.size > maxSize) {
+      return res.status(400).json({ error: 'File size exceeds 5MB limit' });
+    }
+
+    // Get employee ID from emp_code
+    const empResult = await query(
+      'SELECT id FROM employees WHERE emp_code = $1',
+      [emp_code]
+    );
+
+    if (empResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Verify cycle exists and get cycle_id
+    const cycleResult = await query(
+      `SELECT id, year FROM performance_cycles 
+       WHERE id IN (SELECT cycle_id FROM quarterly_self_reviews WHERE employee_id = $1)
+       ORDER BY created_at DESC LIMIT 1`,
+      [employeeId]
+    );
+
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Active performance cycle not found for employee' });
+    }
+
+    const cycleId = cycleResult.rows[0].id;
+
+    // Get the quarter to verify it exists
+    const quarterResult = await query(
+      `SELECT quarter_start_date 
+       FROM quarterly_cycles 
+       WHERE performance_cycle_id = $1 AND quarter = $2`,
+      [cycleId, parseInt(quarter)]
+    );
+
+    if (quarterResult.rows.length === 0) {
+      return res.status(404).json({ error: `Quarter ${quarter} not found in active performance cycle` });
+    }
+
+    // Validate year matches the performance cycle year
+    const cycleYear = cycleResult.rows[0].year;
+    if (parseInt(year) !== cycleYear) {
+      return res.status(400).json({ error: `Year ${year} does not match active performance cycle year ${cycleYear}` });
+    }
+
+    // Generate unique filename: timestamp-originalname
+    const timestamp = Date.now();
+    const originalName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const fileExtension = path.extname(originalName);
+    const fileName = `${timestamp}-${originalName}`;
+
+    // Build SharePoint folder path: PerformanceDocuments/{emp_code}/Quarter-{quarter}-{year}/Rejections
+    const folderPath = `PerformanceDocuments/${emp_code}/Quarter-${quarter}-${year}/Rejections`;
+
+    // Upload file to SharePoint
+    const sharePointUrl = await uploadFileToSharePoint(
+      req.file.buffer,
+      fileName,
+      folderPath
+    );
+
+    res.json({
+      success: true,
+      fileUrl: sharePointUrl,
+      message: 'Rejection document uploaded successfully'
+    });
+  } catch (error) {
+    console.error('Error uploading rejection document:', error);
+    res.status(500).json({
+      error: 'Failed to upload rejection document',
+      message: error.message
+    });
   }
 });
 

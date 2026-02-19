@@ -5,7 +5,21 @@ import { authMiddleware } from '../middleware/auth.js';
 const router = express.Router();
 
 // Helper: Check if user is manager of reportee or has active delegation
+// Also checks for mid-quarter transitions where user is the new manager
 const checkManagerOrDelegate = async (userId, reporteeId, cycleId, quarter) => {
+  // Validate and parse quarter parameter
+  let parsedQuarter = null;
+  if (quarter !== undefined && quarter !== null) {
+    // Check if quarter is a valid integer (not a UUID)
+    const quarterNum = typeof quarter === 'string' ? parseInt(quarter, 10) : quarter;
+    if (isNaN(quarterNum) || quarterNum < 1 || quarterNum > 4) {
+      // Invalid quarter - return not authorized
+      console.error(`[checkManagerOrDelegate] Invalid quarter value: ${quarter}`);
+      return { isAuthorized: false, isDelegate: false };
+    }
+    parsedQuarter = quarterNum;
+  }
+  
   // Get current user's employee record
   const empResult = await query(
     'SELECT id, emp_code FROM employees WHERE profile_id = $1',
@@ -37,18 +51,45 @@ const checkManagerOrDelegate = async (userId, reporteeId, cycleId, quarter) => {
   }
   
   // Check if user has active delegation for this reportee, cycle, and quarter
-  const delegationResult = await query(
-    `SELECT id FROM delegations 
-     WHERE delegate_id = $1 
-       AND reportee_id = $2 
-       AND cycle_id = $3 
-       AND quarter = $4 
-       AND revoked_at IS NULL`,
-    [currentEmpId, reporteeId, cycleId, quarter]
-  );
+  if (parsedQuarter !== null) {
+    const delegationResult = await query(
+      `SELECT id FROM delegations 
+       WHERE delegate_id = $1 
+         AND reportee_id = $2 
+         AND cycle_id = $3 
+         AND quarter = $4 
+         AND revoked_at IS NULL`,
+      [currentEmpId, reporteeId, cycleId, parsedQuarter]
+    );
+    
+    if (delegationResult.rows.length > 0) {
+      return { isAuthorized: true, isDelegate: true };
+    }
+  }
   
-  if (delegationResult.rows.length > 0) {
-    return { isAuthorized: true, isDelegate: true };
+  // Check if user is the new manager in an active transition
+  // Only authorize if transition_date has passed (post-transition period)
+  // This allows new managers to approve goals for post-transition period
+  // First check manager_history for accurate historical data, then fallback to employee_quarter_transitions
+  if (parsedQuarter !== null) {
+    const transitionResult = await query(
+      `SELECT eqt.id 
+       FROM employee_quarter_transitions eqt
+       LEFT JOIN manager_history mh ON mh.transition_id = eqt.id
+       WHERE eqt.employee_id = $1 
+         AND eqt.cycle_id = $2 
+         AND eqt.quarter = $3 
+         AND eqt.transition_date <= CURRENT_DATE
+         AND (
+           COALESCE(mh.new_manager_id, eqt.new_manager_id) = $4
+         )`,
+      [reporteeId, cycleId, parsedQuarter, currentEmpId]
+    );
+    
+    if (transitionResult.rows.length > 0) {
+      console.log(`[Authorization] User ${currentEmpId} is new manager in transition for employee ${reporteeId}, cycle ${cycleId}, quarter ${parsedQuarter}`);
+      return { isAuthorized: true, isDelegate: false, isTransitionManager: true };
+    }
   }
   
   return { isAuthorized: false, isDelegate: false };

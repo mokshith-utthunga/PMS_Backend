@@ -71,8 +71,7 @@ export const testConnection = async () => {
   }
 };
 
-// Query helper function (for backward compatibility with pg-style queries)
-// Converts $1, $2, etc. to Sequelize's ? placeholders
+
 export const query = async (text, params = []) => {
   try {
     // Convert PostgreSQL-style $1, $2 to ? placeholders
@@ -80,6 +79,28 @@ export const query = async (text, params = []) => {
     if (params && params.length > 0) {
       for (let i = params.length; i >= 1; i--) {
         queryText = queryText.replace(new RegExp(`\\$${i}`, 'g'), '?');
+      }
+    }
+
+    // Debug logging for parameter mismatch issues
+    if (params && params.length > 0) {
+      const paramCount = (queryText.match(/\?/g) || []).length;
+      if (paramCount !== params.length) {
+        console.error('Parameter count mismatch detected:');
+        console.error('  Query:', queryText);
+        console.error('  Expected params:', paramCount);
+        console.error('  Actual params:', params.length);
+        console.error('  Params:', params);
+        console.error('  Param types:', params.map(p => typeof p));
+        console.error('  Undefined params:', params.map((p, i) => p === undefined ? i : null).filter(i => i !== null));
+      }
+      
+      // Check for undefined parameters
+      const undefinedIndices = params.map((p, i) => p === undefined ? i : null).filter(i => i !== null);
+      if (undefinedIndices.length > 0) {
+        console.error('Undefined parameters detected at indices:', undefinedIndices);
+        console.error('  Query:', queryText);
+        console.error('  Params:', params);
       }
     }
 
@@ -91,8 +112,7 @@ export const query = async (text, params = []) => {
     const isUpdate = upperQuery.startsWith('UPDATE');
     const isDelete = upperQuery.startsWith('DELETE');
 
-    // For queries with RETURNING, execute without specifying type to let PostgreSQL handle it correctly
-    // This ensures UPDATE/DELETE/INSERT with RETURNING clauses execute and return rows properly
+
     if (hasReturning) {
       const [results] = await sequelize.query(queryText, {
         replacements: params
